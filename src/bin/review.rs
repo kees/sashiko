@@ -283,6 +283,18 @@ async fn main() -> Result<()> {
                         // Use stdio-gemini for the binary as it expects to communicate with parent
                         let provider = sashiko::ai::create_provider(&settings).expect("Failed to create AI provider");
 
+                        // Per-turn logging is implemented once, here, as a provider
+                        // decorator. Because both local-CLI and daemon reviews run this
+                        // same worker binary, wrapping the provider covers both paths.
+                        let provider: std::sync::Arc<dyn sashiko::ai::AiProvider> =
+                            if settings.ai.log_turns {
+                                std::sync::Arc::new(
+                                    sashiko::ai::logging_provider::LoggingProvider::new(provider),
+                                )
+                            } else {
+                                provider
+                            };
+
                         // Enable read_prompt tool only if explicit caching is NOT used.
                         let prompts_dir = PathBuf::from("third_party/prompts/kernel");
                         let prompts_tool_path = Some(prompts_dir.join("tool.md"));

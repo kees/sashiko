@@ -1608,7 +1608,7 @@ async fn run_review_tool(
 
     let stdin_writer = Arc::new(tokio::sync::Mutex::new(stdin));
 
-    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
     use tokio::time::Instant as TokioInstant;
     use tokio::time::timeout_at;
@@ -1637,7 +1637,6 @@ async fn run_review_tool(
             let ai_started = Arc::new(AtomicBool::new(false));
             let total_tokens_used = Arc::new(AtomicUsize::new(0));
             let total_output_tokens_used = Arc::new(AtomicUsize::new(0));
-            let turn_count = Arc::new(AtomicU32::new(0));
 
             let (abort_tx, mut abort_rx) = tokio::sync::mpsc::channel::<anyhow::Error>(1);
 
@@ -1695,7 +1694,6 @@ async fn run_review_tool(
                                         let settings_clone = settings.clone();
                                         let stdin_clone = stdin_writer.clone();
                                         let deadline_clone = deadline.clone();
-                                        let turn_count_clone = turn_count.clone();
                                         let total_tokens_used_clone = total_tokens_used.clone();
                                         let total_output_tokens_used_clone = total_output_tokens_used.clone();
                                         let abort_tx_clone = abort_tx.clone();
@@ -1736,24 +1734,6 @@ async fn run_review_tool(
                                                             content.len(),
                                                         )
                                                         .await;
-                                                }
-                                            }
-
-                                            let mut local_turn = turn_count_clone.fetch_add(1, Ordering::SeqCst);
-                                            local_turn += 1;
-
-                                            if settings_clone.ai.log_turns {
-                                                let n_msgs = req.messages.len();
-                                                let last = req.messages.last();
-                                                let role_str = last.map(|m| format!("{:?}", m.role).to_lowercase()).unwrap_or_default();
-                                                let content_preview = last.and_then(|m| m.content.as_deref()).unwrap_or("(no text content)");
-                                                let preview: String = content_preview.chars().take(300).collect();
-                                                let ellipsis = if content_preview.chars().count() > 300 { "…" } else { "" };
-                                                if let Some(tool_calls) = last.and_then(|m| m.tool_calls.as_ref()) {
-                                                    let names: Vec<&str> = tool_calls.iter().map(|t| t.function_name.as_str()).collect();
-                                                    info!("→ Turn {} ({} msgs): [{role_str}] tool_calls={:?}", local_turn, n_msgs, names);
-                                                } else {
-                                                    info!("→ Turn {} ({} msgs): [{role_str}] {}{}", local_turn, n_msgs, preview, ellipsis);
                                                 }
                                             }
 
@@ -1861,27 +1841,6 @@ async fn run_review_tool(
 
                                                             let _ = abort_tx_clone.send(ReviewError::BudgetExceeded(err_msg).into()).await;
                                                             return;
-                                                        }
-                                                    }
-
-                                                    if settings_clone.ai.log_turns {
-                                                        if let Some(content) = &p.content {
-                                                            let preview: String = content.chars().take(500).collect();
-                                                            let ellipsis = if content.chars().count() > 500 { "…" } else { "" };
-                                                            info!("← Turn {} text: {}{}", local_turn, preview, ellipsis);
-                                                        }
-                                                        if let Some(tool_calls) = &p.tool_calls {
-                                                            for call in tool_calls {
-                                                                let args_str = call.arguments.to_string();
-                                                                let args_preview: String = args_str.chars().take(200).collect();
-                                                                let ellipsis = if args_str.chars().count() > 200 { "…" } else { "" };
-                                                                info!("← Turn {} tool_call: {}({}{})", local_turn, call.function_name, args_preview, ellipsis);
-                                                            }
-                                                        }
-                                                        if let Some(usage) = &p.usage {
-                                                            info!("← Turn {} tokens: in={} out={} cached={}",
-                                                                local_turn, usage.prompt_tokens, usage.completion_tokens,
-                                                                usage.cached_tokens.unwrap_or(0));
                                                         }
                                                     }
 
