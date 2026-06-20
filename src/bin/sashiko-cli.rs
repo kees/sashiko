@@ -191,6 +191,12 @@ enum Commands {
         /// Pause on failure, wait for agent/user to fix code, and re-run automatically
         #[arg(long)]
         interactive: bool,
+
+        /// Stream the review worker's own logs live (per-stage progress, and
+        /// per-turn prompts/tool calls) instead of only the phase markers. Also
+        /// enables `log_turns` in the worker so there is turn detail to show.
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 }
 
@@ -326,6 +332,7 @@ async fn run_command(
             custom_prompt,
             force_local,
             interactive,
+            verbose,
         } => {
             handle_local(
                 client,
@@ -337,6 +344,7 @@ async fn run_command(
                 custom_prompt,
                 force_local,
                 interactive,
+                verbose,
                 format,
             )
             .await
@@ -1425,6 +1433,7 @@ async fn handle_local(
     custom_prompt: Option<String>,
     force_local: bool,
     interactive: bool,
+    verbose: bool,
     format: OutputFormat,
 ) -> Result<()> {
     // Determine repository path
@@ -1565,13 +1574,20 @@ async fn handle_local(
         eprintln!();
 
         // Spawn review subprocess
-        let mut child = tokio::process::Command::new(&review_bin)
-            .args(&args)
+        let mut cmd = tokio::process::Command::new(&review_bin);
+        cmd.args(&args)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .env("SASHIKO_LOG_PLAIN", "1")
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // --verbose forwards the worker's stderr, so also turn on per-turn
+        // logging in the worker — otherwise there would be nothing detailed to
+        // forward. (Left unset without --verbose so Settings.toml still wins.)
+        if verbose {
+            cmd.env("SASHIKO__AI__LOG_TURNS", "true");
+        }
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("Failed to start review binary: {:?}", review_bin))?;
 
@@ -1595,6 +1611,14 @@ async fn handle_local(
                 let mut saw_applying = false;
                 let mut saw_ai_review = false;
                 while let Ok(Some(line)) = lines.next_line().await {
+                    if verbose {
+                        // Forward the worker's logs verbatim: per-stage progress
+                        // ("Running Stage N"), planning decisions, tool calls, and
+                        // validation retries that the phase markers otherwise hide.
+                        // Fall through so the phase markers below still print as
+                        // orientation beacons amid the detailed stream.
+                        eprintln!("{}", line);
+                    }
                     if !saw_applying && line.contains("Applying") {
                         saw_applying = true;
                         eprint_phase(2, 4, "Applying patches to worktree...");
