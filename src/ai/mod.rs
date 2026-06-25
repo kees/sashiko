@@ -516,6 +516,7 @@ pub fn create_provider(settings: &Settings) -> Result<Arc<dyn AiProvider>> {
     }
 }
 #[cfg(feature = "bedrock")]
+pub mod backoff_provider;
 pub mod bedrock;
 pub mod cache;
 pub mod claude;

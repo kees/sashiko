@@ -312,6 +312,19 @@ async fn main() -> Result<()> {
                                 )
                             };
 
+                        // Local reviews also lack the daemon's rate-limit/transient
+                        // backoff, so add it here (outermost, so a backing-off call
+                        // holds no concurrency permit while it waits). Daemon stdio
+                        // workers keep their existing global handling.
+                        let provider: std::sync::Arc<dyn sashiko::ai::AiProvider> =
+                            if settings.ai.provider.starts_with("stdio-") {
+                                provider
+                            } else {
+                                std::sync::Arc::new(
+                                    sashiko::ai::backoff_provider::BackoffProvider::new(provider),
+                                )
+                            };
+
                         // Enable read_prompt tool only if explicit caching is NOT used.
                         let prompts_dir = PathBuf::from("third_party/prompts/kernel");
                         let prompts_tool_path = Some(prompts_dir.join("tool.md"));
