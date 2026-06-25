@@ -295,6 +295,23 @@ async fn main() -> Result<()> {
                                 provider
                             };
 
+                        // Local reviews have no daemon llm_semaphore in front of
+                        // them, so cap concurrent model calls here to honour
+                        // [review] concurrency. Daemon-spawned workers use a
+                        // stdio provider and are throttled globally by the daemon
+                        // instead, so they are left unwrapped.
+                        let provider: std::sync::Arc<dyn sashiko::ai::AiProvider> =
+                            if settings.ai.provider.starts_with("stdio-") {
+                                provider
+                            } else {
+                                std::sync::Arc::new(
+                                    sashiko::ai::concurrency_limited_provider::ConcurrencyLimitedProvider::new(
+                                        provider,
+                                        settings.review.concurrency,
+                                    ),
+                                )
+                            };
+
                         // Enable read_prompt tool only if explicit caching is NOT used.
                         let prompts_dir = PathBuf::from("third_party/prompts/kernel");
                         let prompts_tool_path = Some(prompts_dir.join("tool.md"));
