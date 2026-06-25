@@ -94,7 +94,7 @@ fn validate_inline_format(content: &str) -> std::result::Result<(), String> {
     let has_commit_header = content
         .lines()
         .take(20)
-        .any(|l| l.trim_start().to_lowercase().starts_with("commit "));
+        .any(|l| l.trim_start().to_lowercase().starts_with("commit"));
     if !has_commit_header {
         return Err("The output is missing the 'commit <hash>' header. Please start with the commit details (Commit, Author, Subject) as per `inline-template.md`.".to_string());
     }
