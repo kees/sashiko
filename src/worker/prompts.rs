@@ -84,17 +84,26 @@ pub struct ReviewInput {
     pub patches: Vec<PatchInput>,
 }
 
-fn validate_inline_format(content: &str) -> std::result::Result<(), String> {
+fn validate_inline_format(
+    content: &str,
+    relaxed: bool,
+) -> std::result::Result<(), String> {
     if content.lines().any(|l| l.trim_start().starts_with("```")) {
         return Err("The output contains Markdown code blocks ('```'). It must be plain text as per `inline-template.md`.".to_string());
     }
     if !content.lines().any(|l| l.trim_start().starts_with(">")) {
         return Err("The output does not appear to quote any code or context using '>'. Please follow the quoting style in `inline-template.md`.".to_string());
     }
+    // Relaxed mode keeps only the plain-text and quoting checks above and skips
+    // the remaining structural requirements (commit/author headers and the
+    // presence of comments/summary).
+    if relaxed {
+        return Ok(());
+    }
     let has_commit_header = content
         .lines()
         .take(20)
-        .any(|l| l.trim_start().to_lowercase().starts_with("commit"));
+        .any(|l| l.trim_start().to_lowercase().starts_with("commit "));
     if !has_commit_header {
         return Err("The output is missing the 'commit <hash>' header. Please start with the commit details (Commit, Author, Subject) as per `inline-template.md`.".to_string());
     }
@@ -1341,6 +1350,12 @@ Example Output:
         let mut review_inline_text = String::new();
         {
             let stage = 11;
+            // Relax the inline-report format checks (keep plain-text + quoting,
+            // skip commit/author headers and comments). Useful for local reviews
+            // where the LKML email-style structure is not wanted. Set by
+            // `sashiko-cli local --relaxed-inline-format`.
+            let relaxed_inline_format =
+                std::env::var("SASHIKO_RELAXED_INLINE_FORMAT").is_ok();
             let (stage_prompt, clean_stage_prompt) = self.prompts.get_stage_prompt(stage).await?;
             let system_prompt = shared_context.clone();
             let clean_system_prompt = clean_shared_context.clone();
@@ -1380,7 +1395,7 @@ Example Output:
                             review_inline_text = result_text;
                             break;
                         } else {
-                            match validate_inline_format(&result_text) {
+                            match validate_inline_format(&result_text, relaxed_inline_format) {
                                 Ok(_) => {
                                     review_inline_text = result_text;
                                     break;

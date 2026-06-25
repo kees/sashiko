@@ -197,6 +197,11 @@ enum Commands {
         /// enables `log_turns` in the worker so there is turn detail to show.
         #[arg(long, short = 'v')]
         verbose: bool,
+
+        /// Relax stage 11 inline-report validation: keep the plain-text and
+        /// quoting checks but skip the commit/author headers and comments checks
+        #[arg(long)]
+        relaxed_inline_format: bool,
     },
 }
 
@@ -333,6 +338,7 @@ async fn run_command(
             force_local,
             interactive,
             verbose,
+            relaxed_inline_format,
         } => {
             handle_local(
                 client,
@@ -345,6 +351,7 @@ async fn run_command(
                 force_local,
                 interactive,
                 verbose,
+                relaxed_inline_format,
                 format,
             )
             .await
@@ -1434,6 +1441,7 @@ async fn handle_local(
     force_local: bool,
     interactive: bool,
     verbose: bool,
+    relaxed_inline_format: bool,
     format: OutputFormat,
 ) -> Result<()> {
     // Determine repository path
@@ -1586,6 +1594,10 @@ async fn handle_local(
         // forward. (Left unset without --verbose so Settings.toml still wins.)
         if verbose {
             cmd.env("SASHIKO__AI__LOG_TURNS", "true");
+        }
+        // Relax the stage 11 inline-report format checks in the worker.
+        if relaxed_inline_format {
+            cmd.env("SASHIKO_RELAXED_INLINE_FORMAT", "1");
         }
         let mut child = cmd
             .spawn()
