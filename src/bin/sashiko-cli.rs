@@ -1601,9 +1601,12 @@ async fn handle_local(
             drop(stdin);
         }
 
-        // Stream stderr for progress in a background task
+        // Stream stderr for progress in a background task. Error-relevant lines
+        // are also buffered and returned so they can be surfaced on failure even
+        // without --verbose (otherwise the worker's stderr is dropped here).
         let stderr = child.stderr.take();
         let stderr_handle = tokio::spawn(async move {
+            let mut captured: Vec<String> = Vec::new();
             if let Some(stderr) = stderr {
                 use tokio::io::{AsyncBufReadExt, BufReader};
                 let reader = BufReader::new(stderr);
@@ -1633,8 +1636,19 @@ async fn handle_local(
                         eprint_phase(4, 4, "Review complete.");
                         eprintln!();
                     }
+                    if !verbose {
+                        // In non-verbose mode the worker's stderr is otherwise
+                        // dropped here. stderr is a separate stream from the
+                        // stdout result protocol, so buffer it verbatim and report
+                        // it in full if the review fails. It's bounded naturally by
+                        // the subprocess's lifetime; at info level a review emits
+                        // only modest stderr, so there's no need to truncate it and
+                        // risk dropping the earliest (root-cause) lines.
+                        captured.push(line);
+                    }
                 }
             }
+            captured
         });
 
         // Capture stdout
@@ -1643,12 +1657,13 @@ async fn handle_local(
             .await
             .context("Failed to wait for review subprocess")?;
 
-        let _ = stderr_handle.await;
+        let captured_errors = stderr_handle.await.unwrap_or_default();
 
         let exit_code = output.status.code().unwrap_or(1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 
         if stdout.trim().is_empty() {
+            print_worker_stderr(&captured_errors);
             return Err(anyhow::anyhow!(
                 "Review subprocess produced no output (exit code: {})",
                 exit_code
@@ -1687,6 +1702,13 @@ async fn handle_local(
             {
                 has_issues = true;
             }
+        }
+
+        // print_local_review_results already prints result["error"]; on failure
+        // also dump the worker's buffered stderr for the underlying detail, so
+        // it's visible without --verbose.
+        if has_error {
+            print_worker_stderr(&captured_errors);
         }
 
         if interactive && (has_error || has_issues) {
@@ -1755,6 +1777,21 @@ fn find_review_binary() -> Result<PathBuf> {
          Build it with: cargo build --bin review\n\
          Or specify its location in PATH."
     ))
+}
+
+/// Print the buffered worker stderr (if any) under a header, so a failed review
+/// reports the worker's own diagnostics even without --verbose. stderr is a
+/// distinct stream from the stdout result protocol, so this is the worker's
+/// verbatim output, not a heuristic guess at which lines are errors.
+fn print_worker_stderr(lines: &[String]) {
+    if lines.is_empty() {
+        return;
+    }
+    eprintln!();
+    print_colored(Color::Red, "Worker diagnostics (stderr):\n");
+    for line in lines {
+        eprintln!("  {}", line);
+    }
 }
 
 fn print_local_review_results(result: &Value, input: &str) {
