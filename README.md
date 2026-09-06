@@ -68,7 +68,7 @@ As with any LLM-based tool, Sashiko's output is probabilistic and may vary acros
 
 Sashiko evaluates patches through specialized parallel analysis stages followed by sequential consolidation stages, combined with per-subsystem prompts initially developed by Chris Mason ([review-prompts](https://github.com/masoncl/review-prompts)).
 
-**Analysis stages** (run in parallel; `goal`, `implementation`, and `execution-flow` always run, while the planning stage selects the rest unless overridden via `--stages`). Naming stages also skips the pre-screen, so the guides it would have selected are not loaded; name `pre-screen` alongside them to keep that selection, as in `--stages pre-screen,locking`.
+**Analysis stages** (run in parallel; `goal`, `implementation`, `execution-flow`, and `testability` always run, while the planning stage selects the rest unless overridden via `--stages`). Naming stages also skips the pre-screen, so any stage whose guides the pre-screen selects will run without them; name `pre-screen` alongside them to keep it, as in `--stages pre-screen,testability`.
 
 - **`goal`** — architectural flaws, UAPI breakages, and conceptual correctness.
 - **`implementation`** — whether code matches the commit message, undocumented side-effects, and API contract violations.
@@ -76,6 +76,7 @@ Sashiko evaluates patches through specialized parallel analysis stages followed 
 - **`resources`** — memory leaks, use-after-free (UAF), double frees, and object lifecycles across queues, timers, and workqueues.
 - **`locking`** — concurrency issues, deadlocks, RCU rule violations, and thread-safety.
 - **`security`** — buffer overflows, OOB reads/writes, TOCTOU races, and uninitialized memory leaks.
+- **`testability`** — whether the change should have carried a test, and whether the tests it does carry would fail if the code were wrong.
 - **`hardware`** — register accesses, DMA mapping, memory barriers, and state machine constraints.
 
 **Consolidation stages** (run in sequence):
