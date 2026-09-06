@@ -544,6 +544,9 @@ pub struct AnalysisStage {
     /// Whether the planning stage may leave this one out. The first three
     /// always run, so the planner is only ever asked about the rest.
     pub optional: bool,
+    /// Whether the prompt carries the list of patches that follow this one in
+    /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
+    pub wants_series_context: bool,
 }
 
 pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
@@ -554,6 +557,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         guides: &[],
         uses_commit_log: true,
         optional: false,
+        wants_series_context: false,
     },
     AnalysisStage {
         name: "implementation",
@@ -562,6 +566,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         guides: &[],
         uses_commit_log: true,
         optional: false,
+        wants_series_context: false,
     },
     AnalysisStage {
         name: "execution-flow",
@@ -570,6 +575,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         guides: &["callstack.md", "technical-patterns.md"],
         uses_commit_log: false,
         optional: false,
+        wants_series_context: false,
     },
     AnalysisStage {
         name: "resources",
@@ -578,6 +584,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         guides: &[],
         uses_commit_log: false,
         optional: true,
+        wants_series_context: false,
     },
     AnalysisStage {
         name: "locking",
@@ -586,6 +593,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         guides: &["subsystem/locking.md"],
         uses_commit_log: false,
         optional: true,
+        wants_series_context: false,
     },
     AnalysisStage {
         name: "security",
@@ -594,6 +602,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         guides: &[],
         uses_commit_log: false,
         optional: true,
+        wants_series_context: false,
     },
     AnalysisStage {
         name: "hardware",
@@ -602,6 +611,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         guides: &[],
         uses_commit_log: true,
         optional: true,
+        wants_series_context: false,
     },
 ];
 
@@ -612,26 +622,33 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
 pub struct ConsolidationStage {
     pub name: &'static str,
     pub short: &'static str,
+    /// Whether the prompt carries the list of patches that follow this one in
+    /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
+    pub wants_series_context: bool,
 }
 
 pub static DEDUPLICATION: ConsolidationStage = ConsolidationStage {
     name: "deduplication",
     short: "Deduplication",
+    wants_series_context: false,
 };
 
 pub static CONFLICT_RESOLUTION: ConsolidationStage = ConsolidationStage {
     name: "conflict-resolution",
     short: "Conflict Resolution",
+    wants_series_context: false,
 };
 
 pub static VERIFICATION: ConsolidationStage = ConsolidationStage {
     name: "verification",
     short: "Severity Estimation",
+    wants_series_context: true,
 };
 
 pub static REPORT: ConsolidationStage = ConsolidationStage {
     name: "report",
     short: "Report Generation",
+    wants_series_context: false,
 };
 
 /// In the order the workflow runs them. Each builder refers to its own
@@ -640,15 +657,52 @@ pub static REPORT: ConsolidationStage = ConsolidationStage {
 pub static CONSOLIDATION_STAGES: &[&ConsolidationStage] =
     &[&DEDUPLICATION, &CONFLICT_RESOLUTION, &VERIFICATION, &REPORT];
 
+/// Marks where a stage's prompt carries the list of patches that follow this
+/// one in the series.
+///
+/// Two kinds of question need it. Where a test belongs in a series is only
+/// answerable from what comes after it, and whether a concern still stands can
+/// depend on a later patch reworking the code it is about. Both are declared in
+/// the stage tables rather than wired up per builder, so the placeholder and
+/// the variable that fills it cannot get separated.
+pub const SERIES_CONTEXT_PLACEHOLDER: &str = "{{follow_up_series_section}}";
+
+fn series_context_placeholder(wants: bool) -> &'static str {
+    if wants {
+        SERIES_CONTEXT_PLACEHOLDER
+    } else {
+        ""
+    }
+}
+
+fn with_series_context(
+    template: PromptTemplate<KernelReviewState>,
+    wants: bool,
+) -> PromptTemplate<KernelReviewState> {
+    if !wants {
+        return template;
+    }
+    template.with_var("follow_up_series_section", |s: &KernelReviewState| {
+        s.follow_up_series_context
+            .as_ref()
+            .map(|ctx| format!("\n\n{}", ctx))
+            .unwrap_or_default()
+    })
+}
+
+pub fn consolidation_stage_by_name(name: &str) -> Option<&'static ConsolidationStage> {
+    CONSOLIDATION_STAGES
+        .iter()
+        .copied()
+        .find(|s| s.name == name)
+}
+
 /// Display label for any stage the pipeline runs.
 pub fn stage_short_label(name: &str) -> Option<&'static str> {
     if let Some(def) = analysis_stage_by_name(name) {
         return Some(def.short);
     }
-    CONSOLIDATION_STAGES
-        .iter()
-        .find(|s| s.name == name)
-        .map(|s| s.short)
+    consolidation_stage_by_name(name).map(|s| s.short)
 }
 
 pub fn analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
@@ -669,12 +723,15 @@ fn analysis_stage(
     temperature: f32,
 ) -> Box<dyn ExecutableStage<KernelReviewState>> {
     let mut user_template = PromptTemplate::<KernelReviewState>::new(format!(
-        "{}\n\n{}",
-        def.instruction, STAGE_JSON_SCHEMA_EXAMPLE
+        "{}\n\n{}{}",
+        def.instruction,
+        STAGE_JSON_SCHEMA_EXAMPLE,
+        series_context_placeholder(def.wants_series_context)
     ));
     for guide in def.guides {
         user_template = user_template.include_file(*guide);
     }
+    let user_template = with_series_context(user_template, def.wants_series_context);
 
     Box::new(
         Stage::builder(def.name)
@@ -887,13 +944,14 @@ pub fn verification_stage(
     max_turns: usize,
     temperature: f32,
 ) -> Stage<KernelReviewState, VerificationOutput> {
+    let series_context = series_context_placeholder(VERIFICATION.wants_series_context);
     Stage::builder(VERIFICATION.name)
         .system_prompt(kernel_system_prompt(true))
-        .user_prompt(
+        .user_prompt(with_series_context(
             PromptTemplate::<KernelReviewState>::new(format!(
                 r#"{STAGE_VERIFICATION_INSTRUCTION}
 
-CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.{{{{follow_up_series_section}}}}
+CRITICAL REVIEW DIRECTIVE: To dismiss a concern as a false positive, you must find concrete evidence in the code that proves the concern is invalid (e.g., verifying the caller handles the edge case). If you cannot find concrete proof of safety, you must retain the concern.{series_context}
 
 Consolidated Concerns:
 {{{{conflict_resolved_concerns}}}}
@@ -925,16 +983,11 @@ Example Output:
             ))
             .include_file("false-positive-guide.md")
             .include_file("severity.md")
-            .with_var("follow_up_series_section", |s: &KernelReviewState| {
-                s.follow_up_series_context
-                    .as_ref()
-                    .map(|ctx| format!("\n\n{}", ctx))
-                    .unwrap_or_default()
-            })
             .with_var("conflict_resolved_concerns", |s: &KernelReviewState| {
                 serde_json::to_string_pretty(&s.conflict_resolved_concerns).unwrap_or_default()
             }),
-        )
+            VERIFICATION.wants_series_context,
+        ))
         .output_format(OutputFormat::json())
         .policy(StagePolicy {
             tools: ToolScope::All,
@@ -1060,6 +1113,38 @@ mod tests {
         }
         assert!(analysis_stage_by_name("nonexistent").is_none());
         assert!(!is_known_stage("nonexistent"));
+    }
+
+    #[test]
+    fn test_series_context_is_declared_in_the_tables() {
+        // Both tables carry the flag because the need is not particular to
+        // either kind of stage: verification asks whether a later patch
+        // reworks the code a concern is about.
+        assert!(
+            consolidation_stage_by_name("verification")
+                .unwrap()
+                .wants_series_context
+        );
+        for def in CONSOLIDATION_STAGES
+            .iter()
+            .filter(|d| d.name != "verification")
+        {
+            assert!(!def.wants_series_context, "{} does not use it", def.name);
+        }
+        // The placeholder and the variable that fills it travel together, so a
+        // stage that declares the flag cannot end up rendering it literally.
+        assert_eq!(series_context_placeholder(true), SERIES_CONTEXT_PLACEHOLDER);
+        assert_eq!(series_context_placeholder(false), "");
+    }
+
+    #[test]
+    fn test_no_analysis_stage_asks_for_series_context_yet() {
+        // Both builders honour the flag; nothing in the analysis table sets it
+        // until a stage needs it. A stage that did would get the placeholder
+        // and the variable together, never one without the other.
+        for def in ANALYSIS_STAGES {
+            assert!(!def.wants_series_context, "{} does not use it", def.name);
+        }
     }
 
     #[test]
