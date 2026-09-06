@@ -36,11 +36,12 @@ Sashiko uses a multi-stage review protocol to evaluate patches thoroughly from m
 Stages are identified by name. The analysis stages run in parallel; the
 consolidation stages then run in sequence over what they produced.
 
-**Analysis stages.** `goal`, `implementation` and `execution-flow` always run.
-The planning stage decides which of the rest a patch warrants, and `--stages`
-overrides that choice by name. Naming stages also skips the pre-screen, so the
-guides it would have selected are not loaded; name `pre-screen` alongside them
-to keep that selection, as in `--stages pre-screen,locking`.
+**Analysis stages.** `goal`, `implementation`, `execution-flow` and
+`testability` always run. The planning stage decides which of the rest a patch
+warrants, and `--stages` overrides that choice by name. Naming stages also
+skips the pre-screen, so any stage whose guides the pre-screen selects will run
+without them; name `pre-screen` alongside them to keep it, as in
+`--stages pre-screen,testability`.
 
 - **goal** -- the big picture: architectural flaws, UAPI breakages, and conceptual correctness.
 - **implementation** -- whether the code matches the commit message's claims, checking for missing pieces, undocumented side-effects, and API contract violations.
@@ -48,6 +49,7 @@ to keep that selection, as in `--stages pre-screen,locking`.
 - **resources** -- memory leaks, use-after-free (UAF), double frees, and object lifecycles across queues, timers, and workqueues.
 - **locking** -- concurrency issues, deadlocks, RCU rule violations, and thread-safety.
 - **security** -- buffer overflows, OOB reads/writes, TOCTOU races, and information leaks (like copying uninitialized memory).
+- **testability** -- whether the change should have carried a test, and whether the tests it does carry would fail if the code were wrong.
 - **hardware** -- driver and hardware code: register accesses, DMA mapping, memory barriers, and state machine constraints.
 
 **Consolidation stages**, in order:
