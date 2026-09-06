@@ -87,7 +87,7 @@ pub struct WorkerConfig {
     pub custom_prompt: Option<String>,
     pub series_range: Option<String>,
     pub baseline_sha: Option<String>,
-    pub stages: Option<Vec<u8>>,
+    pub stages: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,16 +95,16 @@ pub enum WorkerProgressEvent {
     PreScreenStarted,
     PlanningStarted,
     ReviewStarted {
-        planned_stages: Vec<u8>,
+        planned_stages: Vec<String>,
     },
     StageStarted {
-        stage: u8,
+        stage: String,
     },
     StageFinished {
-        stage: u8,
+        stage: String,
     },
     StageTurn {
-        stage: u8,
+        stage: String,
         turn: usize,
         max_turns: usize,
     },
@@ -165,7 +165,7 @@ pub struct Worker {
     series_range: Option<String>,
     baseline_sha: Option<String>,
     context_tag: Option<String>,
-    stages: Option<Vec<u8>>,
+    stages: Option<Vec<String>>,
     custom_prompt: Option<String>,
 }
 
@@ -348,12 +348,16 @@ impl Worker {
             if let Some(progress_cb) = progress {
                 match event {
                     WorkflowEvent::StageStarted { stage_name } => {
-                        if stage_name == "stage_0_prescreen" {
+                        if stage_name == "pre-screen" {
                             progress_cb(WorkerProgressEvent::PreScreenStarted);
-                        } else if stage_name == "stage_planning" {
+                        } else if stage_name == "planning" {
                             progress_cb(WorkerProgressEvent::PlanningStarted);
-                        } else if let Some(num) = parse_stage_number(stage_name) {
-                            progress_cb(WorkerProgressEvent::StageStarted { stage: num });
+                        } else if crate::worker::kernel_workflow::analysis_stage_by_name(stage_name)
+                            .is_some()
+                        {
+                            progress_cb(WorkerProgressEvent::StageStarted {
+                                stage: stage_name.to_string(),
+                            });
                         }
                     }
                     WorkflowEvent::ParallelResolved { stage_names } => {
@@ -362,8 +366,12 @@ impl Worker {
                         });
                     }
                     WorkflowEvent::StageFinished { stage_name, .. } => {
-                        if let Some(num) = parse_stage_number(stage_name) {
-                            progress_cb(WorkerProgressEvent::StageFinished { stage: num });
+                        if crate::worker::kernel_workflow::analysis_stage_by_name(stage_name)
+                            .is_some()
+                        {
+                            progress_cb(WorkerProgressEvent::StageFinished {
+                                stage: stage_name.to_string(),
+                            });
                         }
                     }
                     WorkflowEvent::StageTurn {
@@ -371,9 +379,11 @@ impl Worker {
                         turn,
                         max_turns,
                     } => {
-                        if let Some(num) = parse_stage_number(stage_name) {
+                        if crate::worker::kernel_workflow::analysis_stage_by_name(stage_name)
+                            .is_some()
+                        {
                             progress_cb(WorkerProgressEvent::StageTurn {
-                                stage: num,
+                                stage: stage_name.to_string(),
                                 turn,
                                 max_turns,
                             });
@@ -427,24 +437,22 @@ impl Worker {
 /// The stages a review will run: the analysis stages the fan-out resolved, then
 /// the four that always follow them. Nothing resolved means nothing planned,
 /// not a bare tail.
-fn planned_stages_from(stage_names: &[&'static str]) -> Vec<u8> {
-    let mut planned: Vec<u8> = stage_names
+/// The stages a review will run, for the progress display: the analysis stages
+/// the planner chose, plus the consolidation stages that always follow them.
+fn planned_stages_from(stage_names: &[&'static str]) -> Vec<String> {
+    let mut planned: Vec<String> = stage_names
         .iter()
-        .filter_map(|n| parse_stage_number(n))
+        .filter(|n| crate::worker::kernel_workflow::analysis_stage_by_name(n).is_some())
+        .map(|n| n.to_string())
         .collect();
     if !planned.is_empty() {
-        planned.extend([8, 9, 10, 11]);
+        planned.extend(
+            crate::worker::kernel_workflow::CONSOLIDATION_STAGES
+                .iter()
+                .map(|s| s.name.to_string()),
+        );
     }
     planned
-}
-
-fn parse_stage_number(name: &str) -> Option<u8> {
-    if let Some(rest) = name.strip_prefix("stage_")
-        && let Some(num_str) = rest.split('_').next()
-    {
-        return num_str.parse().ok();
-    }
-    None
 }
 
 pub fn calculate_series_range(
@@ -565,7 +573,7 @@ pub fn build_follow_up_series_context(
 fn append_stage_items(
     target: &mut Vec<Value>,
     items: &[Value],
-    stage: u8,
+    stage: &str,
     default_type: &str,
     default_text_key: &str,
 ) {
@@ -577,14 +585,14 @@ fn append_stage_items(
 }
 
 #[cfg(test)]
-fn append_stage_dismissed_concerns(target: &mut Vec<Value>, items: &[Value], stage: u8) {
+fn append_stage_dismissed_concerns(target: &mut Vec<Value>, items: &[Value], stage: &str) {
     append_stage_items(target, items, stage, "General", "description");
 }
 
 #[cfg(test)]
 fn normalize_stage_item(
     item: &Value,
-    stage: u8,
+    stage: &str,
     default_type: &str,
     default_text_key: &str,
 ) -> Option<Value> {
@@ -610,11 +618,20 @@ mod tests {
     #[test]
     fn test_planned_stages_follow_the_resolved_fan_out() {
         assert_eq!(
-            planned_stages_from(&["stage_1", "stage_2", "stage_5"]),
-            vec![1, 2, 5, 8, 9, 10, 11]
+            planned_stages_from(&["goal", "implementation", "locking"]),
+            [
+                "goal",
+                "implementation",
+                "locking",
+                "deduplication",
+                "conflict-resolution",
+                "verification",
+                "report"
+            ]
         );
-        assert_eq!(planned_stages_from(&[]), Vec::<u8>::new());
-        assert_eq!(planned_stages_from(&["stage_planning"]), Vec::<u8>::new());
+        assert_eq!(planned_stages_from(&[]), Vec::<String>::new());
+        // Only analysis stages come through the fan-out.
+        assert_eq!(planned_stages_from(&["planning"]), Vec::<String>::new());
     }
 
     #[test]
@@ -626,10 +643,10 @@ mod tests {
             "reasoning": "hugetlb_free_cross_zone_pages() runs before HVO init"
         })];
 
-        append_stage_dismissed_concerns(&mut items, &input, 1);
+        append_stage_dismissed_concerns(&mut items, &input, "goal");
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["source_stage"], 1);
+        assert_eq!(items[0]["source_stage"], "goal");
         assert_eq!(items[0]["type"], "Resource Management");
         assert_eq!(
             items[0]["reasoning"],
@@ -642,10 +659,10 @@ mod tests {
         let mut items = Vec::new();
         let input = vec![json!("suspected missing cleanup does not apply")];
 
-        append_stage_dismissed_concerns(&mut items, &input, 2);
+        append_stage_dismissed_concerns(&mut items, &input, "implementation");
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["source_stage"], 2);
+        assert_eq!(items[0]["source_stage"], "implementation");
         assert_eq!(items[0]["type"], "General");
         assert_eq!(
             items[0]["description"],
@@ -657,15 +674,15 @@ mod tests {
     fn test_append_stage_items_overwrites_existing_source_stage() {
         let mut items = Vec::new();
         let input = vec![json!({
-            "source_stage": 3,
+            "source_stage": "execution-flow",
             "type": "Execution flow",
             "description": "already annotated"
         })];
 
-        append_stage_items(&mut items, &input, 4, "General", "description");
+        append_stage_items(&mut items, &input, "resources", "General", "description");
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["source_stage"], 4);
+        assert_eq!(items[0]["source_stage"], "resources");
     }
 
     #[test]
@@ -673,10 +690,10 @@ mod tests {
         let mut items = Vec::new();
         let input = vec![json!("plain concern")];
 
-        append_stage_items(&mut items, &input, 6, "General", "description");
+        append_stage_items(&mut items, &input, "security", "General", "description");
 
         assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["source_stage"], 6);
+        assert_eq!(items[0]["source_stage"], "security");
         assert_eq!(items[0]["type"], "General");
         assert_eq!(items[0]["description"], "plain concern");
     }
@@ -1072,7 +1089,7 @@ mod tests {
             series_range: None,
             baseline_sha: None,
             custom_prompt: None,
-            stages: Some(vec![1]),
+            stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1106,7 +1123,7 @@ mod tests {
             series_range: None,
             baseline_sha: Some("explicit_baseline_sha".to_string()),
             custom_prompt: None,
-            stages: Some(vec![1]),
+            stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1144,7 +1161,7 @@ mod tests {
             series_range: Some("base_sha..sha2".to_string()),
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
-            stages: Some(vec![1]),
+            stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1192,11 +1209,16 @@ mod tests {
                 .and_then(|m| m.content.as_deref())
                 .unwrap_or_default();
 
-            let content = if last_user.contains("# Stage 1.") || last_user.contains("# Stage 8.") {
+            // Dispatch on the heading each stage's instruction opens with.
+            // Analysis stages and deduplication return both lists, conflict
+            // resolution only concerns, verification findings.
+            let content = if last_user.contains("# Analyze commit main goal")
+                || last_user.contains("# Deduplication and Consolidation")
+            {
                 r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}], "dismissed_concerns": []}"#
-            } else if last_user.contains("# Stage 9.") {
+            } else if last_user.contains("# Concern/dismissed-concern conflict resolution") {
                 r#"{"concerns": [{"type": "Bug", "description": "some issue", "reasoning": "reason", "preexisting": false, "locations": []}]}"#
-            } else if last_user.contains("# Stage 10.") {
+            } else if last_user.contains("# Verification and severity estimation") {
                 r#"{"findings": []}"#
             } else {
                 r#"{"concerns": [], "dismissed_concerns": []}"#
@@ -1225,7 +1247,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stage_10_log_history_contains_follow_up_series_context() {
+    async fn test_verification_log_history_contains_follow_up_series_context() {
         let temp_dir = tempfile::tempdir().unwrap();
         let prompts_dir = temp_dir.path().join("prompts");
         std::fs::create_dir_all(&prompts_dir).unwrap();
@@ -1240,7 +1262,7 @@ mod tests {
             series_range: Some("base_sha..sha2".to_string()),
             baseline_sha: Some("base_sha".to_string()),
             custom_prompt: None,
-            stages: Some(vec![1]),
+            stages: Some(vec!["goal".to_string()]),
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1268,7 +1290,7 @@ mod tests {
         let worker_res = res.unwrap();
         assert!(!worker_res.history.is_empty());
 
-        let stage10_user_msg = worker_res
+        let verification_user_msg = worker_res
             .history
             .iter()
             .find(|m| {
@@ -1276,11 +1298,11 @@ mod tests {
                     && m.content
                         .as_deref()
                         .unwrap_or_default()
-                        .contains("# Stage 10.")
+                        .contains("# Verification and severity estimation")
             })
-            .expect("Stage 10 user message should be in history");
+            .expect("verification user message should be in history");
 
-        let content = stage10_user_msg.content.as_deref().unwrap();
+        let content = verification_user_msg.content.as_deref().unwrap();
         assert!(content.contains("=== Follow-Up Patches in Series ==="));
         assert!(content.contains("Series End Commit (Final State): sha2"));
         assert!(content.contains("- [Patch 2 of 2] (commit sha2): Patch 2 Subject"));
