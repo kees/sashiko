@@ -28,10 +28,6 @@ use crate::workflow::policy::{ParallelPolicy, RecitationPolicy, StagePolicy, Too
 use crate::workflow::prompt::PromptTemplate;
 use crate::workflow::stage::{ExecutableStage, Stage};
 
-/// Subsystem guides that are loaded per-stage and should be excluded
-/// from the pre-screen's shared context to avoid redundant token usage.
-pub const STAGE_EXCLUSIVE_GUIDES: &[&str] = &["locking.md"];
-
 /// Complete execution state of a Linux kernel patch review.
 #[derive(Clone, Debug, Default)]
 pub struct KernelReviewState {
@@ -461,7 +457,7 @@ pub fn prescreen_stage() -> Stage<KernelReviewState, PrescreenOutput> {
             let prompts: Vec<String> = out
                 .selected_prompts
                 .into_iter()
-                .filter(|name| !STAGE_EXCLUSIVE_GUIDES.contains(&name.as_str()))
+                .filter(|name| !is_stage_exclusive_guide(name))
                 .collect();
             state.selected_guides = prompts;
         })
@@ -703,6 +699,20 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
         return Some(def.short);
     }
     consolidation_stage_by_name(name).map(|s| s.short)
+}
+
+/// Whether a guide belongs to one stage rather than to the shared context.
+///
+/// The pre-screen offers a guide to the whole review, but a guide some stage
+/// loads for itself would then arrive twice: once in that stage's user prompt
+/// and again in every stage's system prompt. Deriving the answer from the
+/// stage table means a guide claimed in the table is excluded by that fact
+/// alone, with no second list to keep in step.
+pub fn is_stage_exclusive_guide(name: &str) -> bool {
+    ANALYSIS_STAGES
+        .iter()
+        .flat_map(|def| def.guides)
+        .any(|guide| guide.rsplit('/').next() == Some(name))
 }
 
 pub fn analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
@@ -1145,6 +1155,27 @@ mod tests {
         for def in ANALYSIS_STAGES {
             assert!(!def.wants_series_context, "{} does not use it", def.name);
         }
+    }
+
+    #[test]
+    fn test_stage_exclusive_guides_follow_the_stage_table() {
+        // Claimed by a stage, so the pre-screen must not also broadcast them.
+        assert!(is_stage_exclusive_guide("locking.md"));
+        assert!(is_stage_exclusive_guide("callstack.md"));
+        assert!(is_stage_exclusive_guide("technical-patterns.md"));
+
+        // Not claimed by any stage: the pre-screen's to offer.
+        assert!(!is_stage_exclusive_guide("mm-vma.md"));
+        assert!(!is_stage_exclusive_guide("subsystem.md"));
+
+        // Matched on the file name, since that is what the pre-screen returns,
+        // while the table holds the path a stage includes it by.
+        assert!(
+            ANALYSIS_STAGES
+                .iter()
+                .any(|d| d.guides.contains(&"subsystem/locking.md"))
+        );
+        assert!(!is_stage_exclusive_guide("subsystem/locking.md"));
     }
 
     #[test]
