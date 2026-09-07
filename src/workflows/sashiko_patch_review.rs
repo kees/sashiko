@@ -357,6 +357,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: true,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "implementation",
@@ -366,6 +367,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: true,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "execution-flow",
@@ -375,6 +377,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "concurrency",
@@ -384,6 +387,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "persistence",
@@ -393,6 +397,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "llm-pipeline",
@@ -406,6 +411,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "security",
@@ -420,6 +426,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "interfaces-compat",
@@ -429,6 +436,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "tests",
@@ -438,6 +446,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
+        prescreen_guides: &[],
     },
 ];
 
