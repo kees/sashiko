@@ -38,7 +38,9 @@ consolidation stages then run in sequence over what they produced.
 
 **Analysis stages.** `goal`, `implementation` and `execution-flow` always run.
 The planning stage decides which of the rest a patch warrants, and `--stages`
-overrides that choice by name.
+overrides that choice by name. Naming stages also skips the pre-screen, so the
+guides it would have selected are not loaded; name `pre-screen` alongside them
+to keep that selection, as in `--stages pre-screen,locking`.
 
 - **goal** -- the big picture: architectural flaws, UAPI breakages, and conceptual correctness.
 - **implementation** -- whether the code matches the commit message's claims, checking for missing pieces, undocumented side-effects, and API contract violations.
