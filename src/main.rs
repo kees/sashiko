@@ -1216,7 +1216,11 @@ fn render_progress(state: &mut ProgressState) {
             .values()
             .map(|p| {
                 if p.planned_stages.is_empty() {
-                    11
+                    // Nothing resolved yet: assume every stage will run, which
+                    // is what the fan-out settles on when the planner is not
+                    // narrowing it.
+                    sashiko::worker::kernel_workflow::ANALYSIS_STAGES.len()
+                        + sashiko::worker::kernel_workflow::CONSOLIDATION_STAGES.len()
                 } else {
                     p.planned_stages.len()
                 }

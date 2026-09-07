@@ -353,9 +353,7 @@ impl Worker {
                             progress_cb(WorkerProgressEvent::PreScreenStarted);
                         } else if stage_name == "planning" {
                             progress_cb(WorkerProgressEvent::PlanningStarted);
-                        } else if crate::worker::kernel_workflow::analysis_stage_by_name(stage_name)
-                            .is_some()
-                        {
+                        } else if is_displayed_stage(stage_name) {
                             progress_cb(WorkerProgressEvent::StageStarted {
                                 stage: stage_name.to_string(),
                             });
@@ -367,9 +365,7 @@ impl Worker {
                         });
                     }
                     WorkflowEvent::StageFinished { stage_name, .. } => {
-                        if crate::worker::kernel_workflow::analysis_stage_by_name(stage_name)
-                            .is_some()
-                        {
+                        if is_displayed_stage(stage_name) {
                             progress_cb(WorkerProgressEvent::StageFinished {
                                 stage: stage_name.to_string(),
                             });
@@ -380,9 +376,7 @@ impl Worker {
                         turn,
                         max_turns,
                     } => {
-                        if crate::worker::kernel_workflow::analysis_stage_by_name(stage_name)
-                            .is_some()
-                        {
+                        if is_displayed_stage(stage_name) {
                             progress_cb(WorkerProgressEvent::StageTurn {
                                 stage: stage_name.to_string(),
                                 turn,
@@ -435,11 +429,19 @@ impl Worker {
     }
 }
 
+/// Whether a stage counts towards the progress display.
+///
+/// Every stage the display names, which is every stage `planned_stages_from()`
+/// counts: the analysis stages and the consolidation stages that follow them.
+/// The pre-screen and the planning stage are excluded, since they report
+/// themselves through events of their own and are not part of that total.
+fn is_displayed_stage(name: &str) -> bool {
+    crate::worker::kernel_workflow::stage_short_label(name).is_some()
+}
+
 /// The stages a review will run: the analysis stages the fan-out resolved, then
 /// the four that always follow them. Nothing resolved means nothing planned,
 /// not a bare tail.
-/// The stages a review will run, for the progress display: the analysis stages
-/// the planner chose, plus the consolidation stages that always follow them.
 fn planned_stages_from(stage_names: &[&'static str]) -> Vec<String> {
     let mut planned: Vec<String> = stage_names
         .iter()
@@ -633,6 +635,22 @@ mod tests {
         assert_eq!(planned_stages_from(&[]), Vec::<String>::new());
         // Only analysis stages come through the fan-out.
         assert_eq!(planned_stages_from(&["planning"]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn test_every_planned_stage_reports_its_progress() {
+        // The display divides finished stages by planned ones, so a stage
+        // counted in the total that never reports finishing strands the bar
+        // short of 100%. Consolidation stages are the ones easily missed:
+        // they are planned, but they are not analysis stages.
+        for stage in planned_stages_from(&["goal", "locking"]) {
+            assert!(is_displayed_stage(&stage), "{stage} is counted but silent");
+        }
+
+        // The two that report through events of their own are not counted, so
+        // they must not report as stages as well.
+        assert!(!is_displayed_stage("pre-screen"));
+        assert!(!is_displayed_stage("planning"));
     }
 
     #[test]
