@@ -309,6 +309,7 @@ impl Worker {
             series_range: self.series_range.clone(),
             follow_up_series_context,
             selected_guides: Vec::new(),
+            stage_selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
             planned_stages: Vec::new(),

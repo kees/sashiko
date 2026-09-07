@@ -44,6 +44,9 @@ pub struct KernelReviewState {
     /// Subsystem guide markdown files selected during the pre-screen and
     /// shared with every stage.
     pub selected_guides: Vec<String>,
+    /// Guides the pre-screen selected that a stage claims for itself. Held
+    /// apart from `selected_guides` so they reach that stage and no other.
+    pub stage_selected_guides: Vec<String>,
     /// Optional manual stages filter (e.g. `--stages goal,locking`).
     pub manual_stages: Option<Vec<String>>,
     /// Caller-supplied instructions appended to the shared system prompt.
@@ -454,12 +457,12 @@ pub fn prescreen_stage() -> Stage<KernelReviewState, PrescreenOutput> {
         })
         .skip_if(prescreen_skipped)
         .reduce(|state, out: PrescreenOutput| {
-            let prompts: Vec<String> = out
+            let (claimed, shared): (Vec<String>, Vec<String>) = out
                 .selected_prompts
                 .into_iter()
-                .filter(|name| !is_stage_exclusive_guide(name))
-                .collect();
-            state.selected_guides = prompts;
+                .partition(|name| is_stage_exclusive_guide(name));
+            state.selected_guides = shared;
+            state.stage_selected_guides = claimed;
         })
         .build()
 }
@@ -543,6 +546,11 @@ pub struct AnalysisStage {
     /// Whether the prompt carries the list of patches that follow this one in
     /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
     pub wants_series_context: bool,
+    /// Guides this stage loads only when the pre-screen selected them, by file
+    /// name as the index lists them. For guidance that applies to some patches
+    /// and not others, where `guides` applies to all of them. Like `guides`,
+    /// these are never broadcast to the other stages.
+    pub prescreen_guides: &'static [&'static str],
 }
 
 pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
@@ -554,6 +562,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "implementation",
@@ -563,6 +572,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "execution-flow",
@@ -572,6 +582,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "resources",
@@ -581,6 +592,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "locking",
@@ -590,6 +602,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "security",
@@ -599,6 +612,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "hardware",
@@ -608,6 +622,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
 ];
 
@@ -711,7 +726,7 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
 pub fn is_stage_exclusive_guide(name: &str) -> bool {
     ANALYSIS_STAGES
         .iter()
-        .flat_map(|def| def.guides)
+        .flat_map(|def| def.guides.iter().chain(def.prescreen_guides))
         .any(|guide| guide.rsplit('/').next() == Some(name))
 }
 
@@ -759,6 +774,16 @@ fn analysis_stage(
     ));
     for guide in def.guides {
         user_template = user_template.include_file(*guide);
+    }
+    if !def.prescreen_guides.is_empty() {
+        let claimed = def.prescreen_guides;
+        user_template = user_template.include_files_from_state(move |s: &KernelReviewState| {
+            s.stage_selected_guides
+                .iter()
+                .filter(|selected| claimed.contains(&selected.as_str()))
+                .map(|selected| PathBuf::from("subsystem").join(selected))
+                .collect()
+        });
     }
     let user_template = with_series_context(user_template, def.wants_series_context);
 
@@ -813,7 +838,21 @@ pub fn resolve_analysis_stages_with_options(
     let mut stages = Vec::new();
     for name in selected_stages {
         match analysis_stage_by_name(&name) {
-            Some(def) => stages.push(analysis_stage(def, max_turns, temperature)),
+            Some(def) => {
+                // Naming stages by hand skips the pre-screen, so a stage whose
+                // guidance depends on what the pre-screen chose runs without
+                // it. Say so, rather than leaving a thinner review to look
+                // like the stage simply had nothing to report.
+                if prescreen_skipped(state) && !def.prescreen_guides.is_empty() {
+                    tracing::warn!(
+                        "Stage {:?} runs without {:?}: naming stages skips the pre-screen that selects them. Add {:?} to --stages to keep it",
+                        def.name,
+                        def.prescreen_guides,
+                        PRESCREEN_STAGE
+                    );
+                }
+                stages.push(analysis_stage(def, max_turns, temperature));
+            }
             // The pre-screen is selectable but is not an analysis stage; its
             // own skip condition reads the same list.
             None if name == PRESCREEN_STAGE => {}
@@ -1183,6 +1222,41 @@ mod tests {
         for def in ANALYSIS_STAGES {
             assert!(!def.wants_series_context, "{} does not use it", def.name);
         }
+    }
+
+    #[test]
+    fn test_no_stage_claims_prescreen_guides_yet() {
+        // The routing works; nothing needs it until a stage has guidance that
+        // applies to some patches and not others.
+        for def in ANALYSIS_STAGES {
+            assert!(def.prescreen_guides.is_empty(), "{} claims some", def.name);
+        }
+    }
+
+    #[test]
+    fn test_a_claimed_guide_is_excluded_from_the_broadcast() {
+        // Synthetic, since no stage claims one yet: whichever way a stage
+        // names a guide, the pre-screen must not also hand it to everyone.
+        let claimed = AnalysisStage {
+            name: "example",
+            short: "Example",
+            instruction: "",
+            guides: &["subsystem/always.md"],
+            uses_commit_log: false,
+            optional: false,
+            wants_series_context: false,
+            prescreen_guides: &["sometimes.md"],
+        };
+        let named = |name: &str| {
+            claimed
+                .guides
+                .iter()
+                .chain(claimed.prescreen_guides)
+                .any(|g| g.rsplit('/').next() == Some(name))
+        };
+        assert!(named("always.md"));
+        assert!(named("sometimes.md"));
+        assert!(!named("elsewhere.md"));
     }
 
     #[test]
