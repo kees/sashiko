@@ -68,7 +68,7 @@ As with any LLM-based tool, Sashiko's output is probabilistic and may vary acros
 
 Sashiko evaluates patches through specialized parallel analysis stages followed by sequential consolidation stages, combined with per-subsystem prompts initially developed by Chris Mason ([review-prompts](https://github.com/masoncl/review-prompts)).
 
-**Analysis stages** (run in parallel; `goal`, `implementation`, and `execution-flow` always run, while the planning stage selects the rest unless overridden via `--stages`):
+**Analysis stages** (run in parallel; `goal`, `implementation`, and `execution-flow` always run, while the planning stage selects the rest unless overridden via `--stages`). Naming stages also skips the pre-screen, so the guides it would have selected are not loaded; name `pre-screen` alongside them to keep that selection, as in `--stages pre-screen,locking`.
 
 - **`goal`** — architectural flaws, UAPI breakages, and conceptual correctness.
 - **`implementation`** — whether code matches the commit message, undocumented side-effects, and API contract violations.

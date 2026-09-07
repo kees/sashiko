@@ -1147,7 +1147,7 @@ pub fn enrich_post_verification_output(
 // ---------------------------------------------------------------------------
 
 pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
-    Stage::builder("pre-screen")
+    Stage::builder(PRESCREEN_STAGE)
         .system_prompt(PromptTemplate::<LinuxPatchReviewState>::new(
             "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```",
         ))
@@ -1173,7 +1173,7 @@ pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
             max_turns: 1,
             ..Default::default()
         })
-        .skip_if(|s| s.manual_stages.is_some())
+        .skip_if(prescreen_skipped)
         .reduce(|state, out: PrescreenOutput| {
             let prompts: Vec<String> = out
                 .selected_prompts
@@ -1194,7 +1194,7 @@ pub fn planning_stage() -> Stage<LinuxPatchReviewState, PlanningOutput> {
         .map(|d| d.name)
         .collect();
 
-    Stage::builder("planning")
+    Stage::builder(PLANNING_STAGE)
         .system_prompt(linux_system_prompt(true))
         .user_prompt(PromptTemplate::<LinuxPatchReviewState>::new(
             r#"Analyze the provided patch and determine which of the following review stages are relevant and should be executed:
@@ -1472,13 +1472,36 @@ pub fn analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
     ANALYSIS_STAGES.iter().find(|s| s.name == normalized)
 }
 
+/// Nameable in `--stages`, though it is not an analysis stage: asking for it
+/// restores the guide selection that naming stages otherwise skips.
+pub const PRESCREEN_STAGE: &str = "pre-screen";
+/// Not nameable in `--stages`. It chooses which stages run, so naming stages
+/// has already answered it and it is skipped either way.
+pub const PLANNING_STAGE: &str = "planning";
+
 /// Every stage name a review can produce, analysis and consolidation alike,
 /// for validating what a caller or the planner asked for.
 pub fn is_known_stage(name: &str) -> bool {
     let normalized = normalize_stage_name(name);
     analysis_stage_by_name(&normalized).is_some()
         || consolidation_stage_by_name(&normalized).is_some()
-        || matches!(normalized.as_str(), "pre-screen" | "planning")
+        || matches!(normalized.as_str(), PRESCREEN_STAGE | PLANNING_STAGE)
+}
+
+/// Whether naming stages leaves the pre-screen out.
+///
+/// Naming stages skips the pre-screen, because the point is usually to run
+/// one stage without the rest. A caller who wants the guide selection as well
+/// can ask for it by name. Naming nothing runs everything, pre-screen included.
+///
+/// Names are normalized first, so asking for it by any spelling the resolver
+/// would accept keeps it.
+fn prescreen_skipped(state: &LinuxPatchReviewState) -> bool {
+    state.manual_stages.as_ref().is_some_and(|names| {
+        !names
+            .iter()
+            .any(|n| normalize_stage_name(n) == PRESCREEN_STAGE)
+    })
 }
 
 fn analysis_stage(
@@ -1554,6 +1577,15 @@ pub fn resolve_analysis_stages_with_options(
     for name in selected_stages {
         match analysis_stage_by_name(&name) {
             Some(def) => stages.push(analysis_stage(def, max_turns, temperature)),
+            // The pre-screen is selectable but is not an analysis stage; its
+            // own skip condition reads the same list.
+            None if name == PRESCREEN_STAGE => {}
+            // Naming a stage that always runs, or one the caller cannot
+            // choose, is a mistake worth saying out loud.
+            None if is_known_stage(&name) => tracing::warn!(
+                "Stage {:?} is not an analysis stage and cannot be selected",
+                name
+            ),
             // Previously an unrecognised entry was dropped in silence, so a
             // mistyped --stages looked like it had worked.
             None => tracing::warn!("Ignoring unknown review stage {:?}", name),
@@ -2071,6 +2103,39 @@ mod tests {
         for def in ANALYSIS_STAGES {
             assert!(!def.wants_series_context, "{} does not use it", def.name);
         }
+    }
+
+    #[test]
+    fn test_the_pre_screen_can_be_named_alongside_analysis_stages() {
+        let manual = |names: &[&str]| LinuxPatchReviewState {
+            manual_stages: Some(names.iter().map(|n| n.to_string()).collect()),
+            ..Default::default()
+        };
+
+        // Naming stages skips the pre-screen, which is the usual intent.
+        assert!(prescreen_skipped(&manual(&["locking"])));
+        // Unless it is named too, which is how a caller keeps guide selection.
+        assert!(!prescreen_skipped(&manual(&[PRESCREEN_STAGE, "locking"])));
+        // Nothing named at all: the pre-screen runs, as on any full review.
+        assert!(!prescreen_skipped(&LinuxPatchReviewState::default()));
+    }
+
+    #[test]
+    fn test_naming_the_pre_screen_selects_no_analysis_stage() {
+        // It is a known stage, so it must not be reported as a typo, and it
+        // must not resolve to an analysis stage either.
+        assert!(is_known_stage(PRESCREEN_STAGE));
+        assert!(analysis_stage_by_name(PRESCREEN_STAGE).is_none());
+
+        let state = LinuxPatchReviewState {
+            manual_stages: Some(vec![PRESCREEN_STAGE.to_string(), "locking".to_string()]),
+            ..Default::default()
+        };
+        let names: Vec<&str> = resolve_analysis_stages_with_options(&state, 1, 1.0)
+            .iter()
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(names, ["locking"]);
     }
 
     #[test]

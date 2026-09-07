@@ -4514,6 +4514,10 @@ mod tests {
         // asked for plus the consolidation stages that always follow.
         assert_eq!(total(&planned(&["locking"], 0)), 1);
 
+        // --stages pre-screen,locking: the pre-screen ran and the planner did
+        // not, so one of the two is counted.
+        assert_eq!(total(&planned(&["locking"], 1)), 2);
+
         // A patch that left by an early exit ran fewer stages than it planned,
         // and the ones it skipped must leave the total rather than strand the bar
         // short of the work it did.
