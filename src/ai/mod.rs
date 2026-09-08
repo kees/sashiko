@@ -408,25 +408,58 @@ pub fn cache_identity_with(model: &str, knobs: &[(&str, Option<&str>)]) -> Strin
     identity
 }
 
-/// Creates an AI provider, optionally wrapping it with a local response cache.
-pub async fn create_provider_cached(
-    settings: &Settings,
-    enable_cache: bool,
-    cache_ttl_days: u64,
-) -> Result<Arc<dyn AiProvider>> {
-    let provider = create_provider(settings)?;
-    if enable_cache {
-        let cache_path = std::path::Path::new(&settings.database.url)
+/// Where a run keeps its response cache: beside the database when it has one,
+/// and under the XDG data directory when it does not.
+///
+/// One rule rather than one per caller, so the file cannot end up named or
+/// placed differently depending on who asked for it.
+fn response_cache_path(database: Option<&str>, data_home: &std::path::Path) -> std::path::PathBuf {
+    // A remote database has no directory for the cache to sit beside, and its
+    // URL is not a path: deriving one would put the cache somewhere meaningless,
+    // and a URL that carries credentials would spell them into directory names
+    // on disk. See Database::new, which builds a remote connection for these.
+    let local = database.filter(|url| !url.contains("://"));
+
+    match local {
+        // A bare filename has no parent worth the name, and means the working
+        // directory: the database is there, so the cache goes there too.
+        Some(file) => std::path::Path::new(file)
             .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
             .unwrap_or(std::path::Path::new("."))
-            .join("response_cache.db");
-        let cached =
-            cache::CachingAiProvider::new(provider, &cache_path.to_string_lossy(), cache_ttl_days)
-                .await?;
-        Ok(Arc::new(cached))
-    } else {
-        Ok(provider)
+            .join("response_cache.db"),
+        None => data_home.join("sashiko").join("response_cache.db"),
     }
+}
+
+/// Creates an AI provider, wrapping it with a response cache when
+/// `ai.response_cache` is set.
+///
+/// `database` is the caller's database, which decides where the cache lives.
+/// A local review passes None: it holds `AiSettings` alone, with no database
+/// for the cache to sit beside.
+pub async fn create_provider_cached(
+    ai: &AiSettings,
+    database: Option<&str>,
+) -> Result<Arc<dyn AiProvider>> {
+    let provider = create_provider_from_ai(ai)?;
+    // A daemon-spawned worker reaches the model through a stdio provider, and
+    // the daemon holds a cache on the far side of it. Caching here as well
+    // would give one run two of them, filled from the same responses.
+    if !ai.response_cache || ai.provider.starts_with("stdio-") {
+        return Ok(provider);
+    }
+    let cache_path = response_cache_path(database, &crate::utils::data_home()?);
+    if let Some(parent) = cache_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let cached = cache::CachingAiProvider::new(
+        provider,
+        &cache_path.to_string_lossy(),
+        ai.response_cache_ttl_days,
+    )
+    .await?;
+    Ok(Arc::new(cached))
 }
 
 /// Creates an AI provider based on the application settings.
@@ -942,6 +975,77 @@ mod tests {
     use crate::worker::prompts::ReviewError;
     use anyhow::anyhow;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn test_a_run_that_caches_through_the_daemon_does_not_cache_again() {
+        let mut settings = Settings::new().expect("Failed to load settings");
+        settings.ai.response_cache = true;
+        settings.ai.provider = "stdio-gemini".to_string();
+
+        // Nothing wraps the provider, so nothing is opened either: asking for
+        // a cache here would have written one under the data directory.
+        let provider = create_provider_cached(&settings.ai, None).await.unwrap();
+        assert!(provider.cache_stats().is_none());
+    }
+
+    #[test]
+    fn test_the_response_cache_follows_the_database_or_the_data_directory() {
+        // Composition only, taking the data directory as an argument: reading
+        // it from XDG_DATA_HOME here would race the prompt bundle's own test,
+        // which sets that variable in this same test binary.
+        let data_home = std::path::Path::new("/data");
+
+        assert_eq!(
+            response_cache_path(Some("/srv/sashiko.db"), data_home),
+            std::path::PathBuf::from("/srv/response_cache.db")
+        );
+        assert_eq!(
+            response_cache_path(None, data_home),
+            std::path::PathBuf::from("/data/sashiko/response_cache.db")
+        );
+
+        // A bare filename means the working directory, which is where the
+        // database is: said outright rather than left to an empty parent, whose
+        // join happens to produce a bare filename back.
+        assert_eq!(
+            response_cache_path(Some("sashiko.db"), data_home),
+            std::path::PathBuf::from("./response_cache.db")
+        );
+
+        // Whatever the database is, the cache lands somewhere with a directory
+        // that can be created. A bare filename used to leave an empty one, from
+        // Path::parent() answering Some("") rather than None, and a caller that
+        // creates the directory before opening the cache has nothing to work
+        // with then.
+        for database in [
+            Some("sashiko.db"),
+            Some("/srv/sashiko.db"),
+            Some("libsql://example.com/sashiko"),
+            None,
+        ] {
+            let path = response_cache_path(database, data_home);
+            let parent = path.parent().expect("a directory to create");
+            assert!(
+                !parent.as_os_str().is_empty(),
+                "{database:?} left no directory to create: {path:?}"
+            );
+        }
+
+        // A remote database has no directory to sit beside, so the cache goes to
+        // the data directory rather than to a path made out of the URL. A URL
+        // that carries credentials must not reach the filesystem at all.
+        for url in [
+            "libsql://user:hunter2@example.com/sashiko",
+            "https://example.com/sashiko",
+        ] {
+            let path = response_cache_path(Some(url), data_home);
+            assert_eq!(
+                path,
+                std::path::PathBuf::from("/data/sashiko/response_cache.db")
+            );
+            assert!(!path.to_string_lossy().contains("hunter2"), "{path:?}");
+        }
+    }
 
     #[test]
     fn test_ai_request_contract() -> Result<()> {

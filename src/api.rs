@@ -1456,7 +1456,9 @@ async fn analyze_bug(
         ));
     }
 
-    let provider = match crate::ai::create_provider_cached(&state.settings, false, 0).await {
+    // Uncached, as this asked for before the cached constructor grew to take the
+    // AI settings and a database path: filing a bug is a one-off analysis.
+    let provider = match crate::ai::create_provider(&state.settings) {
         Ok(p) => p,
         Err(e) => {
             // The reason names the provider and its configuration, so it stays

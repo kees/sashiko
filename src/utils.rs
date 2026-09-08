@@ -12,8 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use anyhow::Result;
 use regex::Regex;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+/// The XDG data directory, where anything Sashiko keeps between runs lives:
+/// the installed prompt bundle, and the response cache for a review with no
+/// database beside it.
+pub fn data_home() -> Result<PathBuf> {
+    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(data_home));
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(Path::new(&home).join(".local/share"));
+    }
+
+    Ok(std::env::current_dir()?.join(".local/share"))
+}
 
 static KEY_REGEX: OnceLock<Regex> = OnceLock::new();
 static URL_CRED_REGEX: OnceLock<Regex> = OnceLock::new();

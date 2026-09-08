@@ -126,13 +126,9 @@ impl Reviewer {
                 }
             };
 
-        let provider = create_provider_cached(
-            &settings,
-            settings.ai.response_cache,
-            settings.ai.response_cache_ttl_days,
-        )
-        .await
-        .expect("Failed to create AI provider");
+        let provider = create_provider_cached(&settings.ai, Some(settings.database.url.as_str()))
+            .await
+            .expect("Failed to create AI provider");
 
         let llm_concurrency = crate::ai::concurrency_limited_provider::llm_permits(concurrency);
 

@@ -314,9 +314,13 @@ local_review::decorate_provider          reviewer::run_review_tool_with_cmd
   concrete provider                       concrete provider
 ```
 
-The cache is applied by `create_provider_cached`, which wraps the raw
+The cache is applied by `create_provider_cached(ai, database)`, taking an
+`&AiSettings` and an `Option<&str>` location hint, which wraps the raw
 provider *before* anything else sees it; the limiters are added later, by
-the front end.
+the front end. It consults `ai.response_cache` itself and hands back the
+bare provider when that is off or the provider is `stdio-*`, so
+`create_provider` and `create_provider_from_ai` never cache at all. What
+`database` does with the location is section 5(b).
 
 **Invariant: backoff outside the concurrency limit.** Stated in
 `decorate_provider`'s comment: "so a call that is waiting out a rate limit
@@ -357,11 +361,11 @@ prefix gets double-throttled or, worse, counted twice.
 
 **What breaks if a provider is constructed outside the stack.** Several
 call sites do exactly this on purpose — `api.rs` builds a bare provider
-with `create_provider_cached(&state.settings, false, 0)` for a one-shot
-request. That path has no backoff, no concurrency ceiling, no turn
-logging and no cache. If a diff adds a new entry point that builds its
-own provider, ask which of the four it needs; the common mistake is to
-get rate-limited in a path nobody thought was hot.
+with `create_provider(&state.settings)` for a one-shot request. That path
+has no backoff, no concurrency ceiling, no turn logging and no cache. If
+a diff adds a new entry point that builds its own provider, ask which of
+the four it needs; the common mistake is to get rate-limited in a path
+nobody thought was hot.
 
 ### `QuotaManager` and `RetryBudget`
 
@@ -417,6 +421,13 @@ the history of getting this right.
 `SHA256(cache_identity || "\0" || canonical_request_json)`, where the
 canonical form has `context_tag` removed and `scrub_thought_signatures`
 applied. TTL-swept on construction.
+
+**Where the file lives** is `response_cache_path`: beside the database
+when `database.url` names a local file, and `$XDG_DATA_HOME/sashiko/`
+otherwise — a remote URL, or no database at all, which is the case for
+`sashiko review`. A remote URL must never be treated as a path, since its
+credentials would become a directory name, and a bare filename must not
+resolve to an empty parent.
 
 Assumptions a diff can break:
 - **`context_tag` must stay out of the key.** It carries `[ps:123 p:1 s:4]`,

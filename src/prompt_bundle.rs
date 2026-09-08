@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::project::ProjectId;
 
@@ -80,21 +80,9 @@ pub fn install_prompt_bundle(force: bool) -> Result<PathBuf> {
 }
 
 pub fn prompt_bundle_root() -> Result<PathBuf> {
-    Ok(data_home()?
+    Ok(crate::utils::data_home()?
         .join("sashiko/prompts")
         .join(PROMPT_BUNDLE_REVISION))
-}
-
-fn data_home() -> Result<PathBuf> {
-    if let Some(data_home) = std::env::var_os("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(data_home));
-    }
-
-    if let Some(home) = std::env::var_os("HOME") {
-        return Ok(Path::new(&home).join(".local/share"));
-    }
-
-    Ok(std::env::current_dir()?.join(".local/share"))
 }
 
 #[cfg(test)]
