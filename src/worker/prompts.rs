@@ -692,11 +692,14 @@ mod tests {
             );
         }
 
-        assert!(!crate::workflows::is_counted_stage(
+        // The pre-screen and the planner count as well, from the moment they
+        // start: each does a model call, and a bar that leaves them out sits at
+        // zero while two stages come and go.
+        assert!(crate::workflows::is_counted_stage(
             ProjectId::Linux,
             "pre-screen"
         ));
-        assert!(!crate::workflows::is_counted_stage(
+        assert!(crate::workflows::is_counted_stage(
             ProjectId::Sashiko,
             "planning"
         ));

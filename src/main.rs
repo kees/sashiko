@@ -1239,6 +1239,12 @@ struct PatchState {
     active_stages: std::collections::BTreeSet<String>,
     completed_stages: usize,
     active_stage_turns: std::collections::HashMap<String, usize>,
+    /// Stages that ran before the fan-out resolved, and so are not in
+    /// `planned_stages`: the pre-screen and the planner.
+    ///
+    /// Counted as they start rather than predicted, because whether either runs
+    /// depends on `--stages`. A stage that has started is one that ran.
+    preliminary_stages: usize,
 }
 
 /// The window size of the terminal behind `stream`, in rows and columns, or
@@ -1837,16 +1843,7 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         let total_stages: usize = state
             .patches
             .values()
-            .map(|p| {
-                if p.planned_stages.is_empty() {
-                    // Nothing resolved yet: assume every stage will run, which
-                    // is what the fan-out settles on when the planner is not
-                    // narrowing it.
-                    sashiko::workflows::default_stage_count(state.project)
-                } else {
-                    p.planned_stages.len()
-                }
-            })
+            .map(|p| patch_stage_total(state.project, p))
             .sum();
         let completed_stages: usize = state.patches.values().map(|p| p.completed_stages).sum();
         let width = 20;
@@ -1874,6 +1871,32 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
 
     write!(out, "\x1b8")?;
     out.flush()
+}
+
+/// Stages this patch will have run by the time it is finished.
+///
+/// The pre-screen and the planner are added as they start, since whether they
+/// run is not knowable in advance. The rest are whatever the fan-out resolved
+/// to, plus the consolidation stages that always follow; before it resolves,
+/// assume every stage, which is where a review with no `--stages` and a generous
+/// planner ends up anyway.
+fn patch_stage_total(project: ProjectId, p: &PatchState) -> usize {
+    // Once a patch is done, what it ran is all it was ever going to run. The
+    // workflow leaves by an early exit whenever a stage empties the concern
+    // list, and the consolidation stages after that point never run, though
+    // planned_stages counted them. Whatever else went unrun, a failed stage
+    // under BestEffort say, is settled here too.
+    if matches!(p.status, PatchStatus::Finished) {
+        return p.completed_stages;
+    }
+
+    let planned = if p.planned_stages.is_empty() {
+        sashiko::workflows::default_stage_count(project)
+    } else {
+        p.planned_stages.len()
+    };
+
+    p.preliminary_stages + planned
 }
 
 fn calculate_progress_metrics(
@@ -1974,6 +1997,7 @@ async fn handle_review_command(
                             active_stages: std::collections::BTreeSet::new(),
                             completed_stages: 0,
                             active_stage_turns: std::collections::HashMap::new(),
+                            preliminary_stages: 0,
                         },
                     );
                 }
@@ -2008,12 +2032,14 @@ async fn handle_review_command(
             ProgressEvent::AiReviewPreScreenStarted { patch_index } => {
                 if let Some(p) = s.patches.get_mut(&patch_index) {
                     p.status = PatchStatus::PreScreening;
+                    p.preliminary_stages += 1;
                     render_progress(&mut s);
                 }
             }
             ProgressEvent::AiReviewPlanningStarted { patch_index } => {
                 if let Some(p) = s.patches.get_mut(&patch_index) {
                     p.status = PatchStatus::Planning;
+                    p.preliminary_stages += 1;
                     render_progress(&mut s);
                 }
             }
@@ -3161,6 +3187,7 @@ mod tests {
             active_stages: std::collections::BTreeSet::new(),
             completed_stages: 0,
             active_stage_turns: std::collections::HashMap::new(),
+            preliminary_stages: 0,
         }
     }
 
@@ -3781,6 +3808,33 @@ mod tests {
         // It changes when the set changes, which is what the line is for.
         p.active_stages.remove("locking");
         assert_eq!(status_label(ProjectId::Linux, &p, false), "Security Audit");
+    }
+
+    #[test]
+    fn test_the_stage_total_counts_only_the_preliminaries_that_ran() {
+        let every = sashiko::workflows::default_stage_count(ProjectId::Linux);
+        let planned = |names: &[&str], preliminary| PatchState {
+            planned_stages: names.iter().map(|n| n.to_string()).collect(),
+            preliminary_stages: preliminary,
+            ..patch_state(PatchStatus::Reviewing)
+        };
+        let total = |p: &PatchState| patch_stage_total(ProjectId::Linux, p);
+
+        // A full review: the pre-screen and the planner both ran, and the fan-out
+        // has not resolved yet, so assume the rest of them.
+        assert_eq!(total(&planned(&[], 2)), 2 + every);
+
+        // --stages locking: neither preliminary ran, and the plan is what was
+        // asked for plus the consolidation stages that always follow.
+        assert_eq!(total(&planned(&["locking"], 0)), 1);
+
+        // A patch that left by an early exit ran fewer stages than it planned,
+        // and the ones it skipped must leave the total rather than strand the bar
+        // short of the work it did.
+        let mut done = planned(&["locking"], 2);
+        done.status = PatchStatus::Finished;
+        done.completed_stages = 4;
+        assert_eq!(total(&done), 4);
     }
 
     #[test]

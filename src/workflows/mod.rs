@@ -43,8 +43,14 @@ pub fn default_stage_count(project: ProjectId) -> usize {
 }
 
 /// Whether a stage counts towards the review progress display.
+///
+/// The analysis and consolidation stages are the ones `planned_stages_from()`
+/// totals in advance. The pre-screen and the planner cannot be totalled that
+/// way, because whether either runs depends on `--stages`, so the display counts
+/// them as it sees them start instead. Either way a stage that finishes has to
+/// say so, or the bar stops short of the work it did.
 pub fn is_counted_stage(project: ProjectId, name: &str) -> bool {
-    stage_short_label(project, name).is_some()
+    stage_short_label(project, name).is_some() || matches!(name, "pre-screen" | "planning")
 }
 
 /// Resolves the ordered list of stages a review will run (analysis fan-out
