@@ -1024,19 +1024,22 @@ struct PatchState {
     active_stage_turns: std::collections::HashMap<String, usize>,
 }
 
-fn get_terminal_width() -> usize {
+/// Rows and columns, asked once: a repaint must not shell out to stty.
+fn get_terminal_size() -> (usize, usize) {
     if let Ok(output) = std::process::Command::new("stty").arg("size").output() {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let parts: Vec<&str> = stdout.split_whitespace().collect();
-        if let Some(cols) = parts
-            .get(1)
-            .filter(|_| parts.len() == 2)
-            .and_then(|s| s.parse::<usize>().ok())
+        if parts.len() == 2
+            && let (Ok(rows), Ok(cols)) = (parts[0].parse(), parts[1].parse())
         {
-            return cols;
+            return (rows, cols);
         }
     }
 
+    (24, get_terminal_width())
+}
+
+fn get_terminal_width() -> usize {
     if let Ok(cols) = std::env::var("COLUMNS")
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
@@ -1054,6 +1057,10 @@ struct ProgressState {
     /// speaks only when one of them changes.
     last_status: std::collections::BTreeMap<i64, String>,
     printed_lines: usize,
+    /// Lines currently reserved at the bottom of the screen for the display,
+    /// zero before the region is set up and after it is given back.
+    reserved: usize,
+    terminal_rows: usize,
     total_turns: usize,
     terminal_width: usize,
     color_choice: ColorChoice,
@@ -1194,18 +1201,36 @@ fn render_progress(state: &mut ProgressState) {
         return;
     }
 
-    // The whole frame, erase included, is painted here and written once.
-    let out = BufferWriter::stderr(state.color_choice);
-    let mut frame = out.buffer();
+    // Held for the whole repaint. Every write to stderr takes this lock, so
+    // nothing can land between the cursor being saved and restored and be
+    // written into the reserved lines. Reentrant, so the writes below re-enter
+    // it rather than deadlock.
+    let _stderr = std::io::stderr().lock();
 
-    for _ in 0..state.printed_lines {
-        let _ = write!(&mut frame, "\x1b[F\x1b[2K");
+    let out = BufferWriter::stderr(state.color_choice);
+
+    // The display occupies one line per patch and one for the overall bar.
+    // Reserving happens once, and again if the count changes, which it does
+    // when the patches first become known.
+    let wanted = state.patches.len() + 1;
+    if wanted != state.reserved {
+        reserve_progress_region(&out, state, wanted);
     }
+    if state.reserved == 0 {
+        return;
+    }
+
+    let mut frame = out.buffer();
+    // Save the cursor, address the reserved lines outright, and put it back:
+    // ordinary output carries on where it left off, above.
+    let _ = write!(&mut frame, "\x1b7");
+    let top = state.terminal_rows.saturating_sub(state.reserved) + 1;
 
     let mut lines_printed = 0;
     let limit = state.terminal_width.saturating_sub(5);
 
     for (&idx, p) in &state.patches {
+        let _ = write!(&mut frame, "\x1b[{};1H\x1b[2K", top + lines_printed);
         let status_str = status_label(p, true);
 
         // Calculate available width for subject to guarantee status is never truncated
@@ -1247,7 +1272,6 @@ fn render_progress(state: &mut ProgressState) {
         };
         let _ = tw.write_segment(&mut frame, &status_str, status_color, status_bold);
 
-        let _ = writeln!(&mut frame);
         lines_printed += 1;
     }
 
@@ -1273,6 +1297,7 @@ fn render_progress(state: &mut ProgressState) {
         let (display_completed_stages, percent, filled) =
             calculate_progress_metrics(total_stages, completed_stages, width);
 
+        let _ = write!(&mut frame, "\x1b[{};1H\x1b[2K", top + lines_printed);
         let mut tw = TruncatingWriter::new(limit);
         let _ = tw.write_segment(&mut frame, "Overall: [", None, true);
 
@@ -1290,12 +1315,53 @@ fn render_progress(state: &mut ProgressState) {
         );
         let _ = tw.write_segment(&mut frame, &stats, None, false);
 
-        let _ = writeln!(&mut frame);
         lines_printed += 1;
     }
 
     state.printed_lines = lines_printed;
+    let _ = write!(&mut frame, "\x1b8");
     let _ = out.print(&frame);
+}
+
+/// Reserves `wanted` lines at the bottom of the screen for the display.
+///
+/// Scrolls the screen up to make room, then confines scrolling to everything
+/// above with DECSTBM, so ordinary output can never write there. Deliberately
+/// moves the cursor, which is why it runs outside the save and restore pair a
+/// repaint uses.
+fn reserve_progress_region(out: &BufferWriter, state: &mut ProgressState, wanted: usize) {
+    // A frame taller than the screen has nowhere to go.
+    if wanted + 1 > state.terminal_rows {
+        state.reserved = 0;
+        return;
+    }
+
+    let mut setup = out.buffer();
+    let split = state.terminal_rows - wanted;
+    // Full screen first, so the newlines below scroll everything, including
+    // whatever the previous reservation was holding.
+    let _ = write!(&mut setup, "\x1b[r\x1b[{};1H", state.terminal_rows);
+    for _ in 0..wanted.saturating_sub(state.reserved) {
+        let _ = writeln!(&mut setup);
+    }
+    let _ = write!(&mut setup, "\x1b[1;{split}r\x1b[{split};1H");
+    let _ = out.print(&setup);
+
+    state.reserved = wanted;
+    state.printed_lines = 0;
+}
+
+/// Gives the screen back: scrolling returns to the whole of it and the cursor
+/// lands below the display, so whatever prints next starts on a clean line.
+///
+/// Called before the report rather than left to a destructor, since the review
+/// exits through std::process::exit on findings and destructors do not run.
+fn release_progress_region(state: &mut ProgressState) {
+    if state.reserved == 0 {
+        return;
+    }
+    eprintln!("\x1b[r\x1b[{};1H", state.terminal_rows);
+    state.reserved = 0;
 }
 
 fn calculate_progress_metrics(
@@ -1355,12 +1421,15 @@ async fn handle_review_command(
         }
     }
 
+    let (rows, cols) = get_terminal_size();
     let progress_state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState {
         patches: std::collections::BTreeMap::new(),
         last_status: std::collections::BTreeMap::new(),
         printed_lines: 0,
         total_turns: 0,
-        terminal_width: get_terminal_width(),
+        reserved: 0,
+        terminal_rows: rows,
+        terminal_width: cols,
         color_choice: display_ansi,
     }));
 
@@ -1500,6 +1569,11 @@ async fn handle_review_command(
         Some(&progress),
     )
     .await?;
+
+    // Before anything is printed, and before the exits below: the report and
+    // the shell prompt both belong on a screen whose scrolling is its own
+    // again, and std::process::exit runs no destructors.
+    release_progress_region(&mut progress_state.lock().unwrap());
 
     match format {
         OutputFormat::Json => {
@@ -2428,6 +2502,8 @@ mod tests {
             patches: std::collections::BTreeMap::new(),
             last_status: std::collections::BTreeMap::new(),
             printed_lines: 0,
+            reserved: 0,
+            terminal_rows: 40,
             total_turns: 0,
             terminal_width: 100,
             color_choice,
@@ -2468,6 +2544,30 @@ mod tests {
             assert_eq!(ansi_choice(ColorMode::Always, stream), ColorChoice::Always);
             assert_eq!(ansi_choice(ColorMode::Never, stream), ColorChoice::Never);
         }
+    }
+
+    #[test]
+    fn test_a_frame_taller_than_the_screen_reserves_nothing() {
+        // Reserving every line would leave ordinary output nowhere to go, so
+        // the display stands down rather than confining the review to a
+        // scrolling region of zero lines.
+        let out = BufferWriter::stderr(ColorChoice::Never);
+        let mut state = progress_state(ColorChoice::Never);
+        state.terminal_rows = 4;
+
+        reserve_progress_region(&out, &mut state, 8);
+        assert_eq!(state.reserved, 0);
+
+        // One line for the bar and one to scroll in is the least that works.
+        reserve_progress_region(&out, &mut state, 3);
+        assert_eq!(state.reserved, 3);
+
+        // And giving it back leaves nothing reserved, so a second release is
+        // harmless and the report prints on a screen that scrolls normally.
+        release_progress_region(&mut state);
+        assert_eq!(state.reserved, 0);
+        release_progress_region(&mut state);
+        assert_eq!(state.reserved, 0);
     }
 
     #[test]
