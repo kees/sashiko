@@ -28,7 +28,7 @@ use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -1068,20 +1068,16 @@ fn stage_short_name(stage: &str) -> &'static str {
 struct TruncatingWriter {
     limit: usize,
     written: usize,
-    color_choice: ColorChoice,
 }
 
 impl TruncatingWriter {
-    fn new(limit: usize, color_choice: ColorChoice) -> Self {
-        Self {
-            limit,
-            written: 0,
-            color_choice,
-        }
+    fn new(limit: usize) -> Self {
+        Self { limit, written: 0 }
     }
 
     fn write_segment(
         &mut self,
+        out: &mut Buffer,
         text: &str,
         color: Option<Color>,
         bold: bool,
@@ -1098,7 +1094,6 @@ impl TruncatingWriter {
             (text.to_string(), "")
         };
 
-        let mut stderr = StandardStream::stderr(self.color_choice);
         let mut spec = ColorSpec::new();
         if let Some(c) = color {
             spec.set_fg(Some(c));
@@ -1106,18 +1101,18 @@ impl TruncatingWriter {
         if bold {
             spec.set_bold(true);
         }
-        stderr.set_color(&spec)?;
-        write!(&mut stderr, "{}", to_write)?;
+        out.set_color(&spec)?;
+        write!(out, "{}", to_write)?;
 
         self.written += to_write.chars().count();
 
         if !suffix.is_empty() {
-            stderr.reset()?;
-            write!(&mut stderr, "{}", suffix)?;
+            out.reset()?;
+            write!(out, "{}", suffix)?;
             self.written += 3;
         }
 
-        stderr.reset()
+        out.reset()
     }
 }
 
@@ -1199,11 +1194,12 @@ fn render_progress(state: &mut ProgressState) {
         return;
     }
 
-    if state.printed_lines > 0 {
-        for _ in 0..state.printed_lines {
-            eprint!("\x1b[F\x1b[2K");
-        }
-        let _ = std::io::stderr().flush();
+    // The whole frame, erase included, is painted here and written once.
+    let out = BufferWriter::stderr(state.color_choice);
+    let mut frame = out.buffer();
+
+    for _ in 0..state.printed_lines {
+        let _ = write!(&mut frame, "\x1b[F\x1b[2K");
     }
 
     let mut lines_printed = 0;
@@ -1238,10 +1234,10 @@ fn render_progress(state: &mut ProgressState) {
             subject_padded.push_str(&" ".repeat(padding_chars));
         }
 
-        let mut tw = TruncatingWriter::new(limit, state.color_choice);
-        let _ = tw.write_segment(&format!("      [Patch {}] ", idx), None, false);
-        let _ = tw.write_segment(&subject_padded, None, false);
-        let _ = tw.write_segment(" | ", None, false);
+        let mut tw = TruncatingWriter::new(limit);
+        let _ = tw.write_segment(&mut frame, &format!("      [Patch {}] ", idx), None, false);
+        let _ = tw.write_segment(&mut frame, &subject_padded, None, false);
+        let _ = tw.write_segment(&mut frame, " | ", None, false);
 
         let (status_color, status_bold) = match &p.status {
             PatchStatus::Queued => (None, false),
@@ -1249,9 +1245,9 @@ fn render_progress(state: &mut ProgressState) {
             PatchStatus::Reviewing => (Some(Color::Cyan), true),
             PatchStatus::Finished => (Some(Color::Green), true),
         };
-        let _ = tw.write_segment(&status_str, status_color, status_bold);
+        let _ = tw.write_segment(&mut frame, &status_str, status_color, status_bold);
 
-        eprintln!();
+        let _ = writeln!(&mut frame);
         lines_printed += 1;
     }
 
@@ -1277,29 +1273,29 @@ fn render_progress(state: &mut ProgressState) {
         let (display_completed_stages, percent, filled) =
             calculate_progress_metrics(total_stages, completed_stages, width);
 
-        let mut tw = TruncatingWriter::new(limit, state.color_choice);
-        let _ = tw.write_segment("Overall: [", None, true);
+        let mut tw = TruncatingWriter::new(limit);
+        let _ = tw.write_segment(&mut frame, "Overall: [", None, true);
 
         let filled_bar = "█".repeat(filled);
-        let _ = tw.write_segment(&filled_bar, Some(Color::Green), false);
+        let _ = tw.write_segment(&mut frame, &filled_bar, Some(Color::Green), false);
 
         let empty_bar = "░".repeat(width.saturating_sub(filled));
-        let _ = tw.write_segment(&empty_bar, None, false);
+        let _ = tw.write_segment(&mut frame, &empty_bar, None, false);
 
-        let _ = tw.write_segment("] ", None, true);
+        let _ = tw.write_segment(&mut frame, "] ", None, true);
 
         let stats = format!(
             "{}% | {}/{} stages | {} turns",
             percent, display_completed_stages, total_stages, state.total_turns
         );
-        let _ = tw.write_segment(&stats, None, false);
+        let _ = tw.write_segment(&mut frame, &stats, None, false);
 
-        eprintln!();
+        let _ = writeln!(&mut frame);
         lines_printed += 1;
     }
 
     state.printed_lines = lines_printed;
-    let _ = std::io::stderr().flush();
+    let _ = out.print(&frame);
 }
 
 fn calculate_progress_metrics(
