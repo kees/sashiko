@@ -1050,6 +1050,9 @@ fn get_terminal_width() -> usize {
 
 struct ProgressState {
     patches: std::collections::BTreeMap<i64, PatchState>,
+    /// The status each patch was last reported with, so the appending display
+    /// speaks only when one of them changes.
+    last_status: std::collections::BTreeMap<i64, String>,
     printed_lines: usize,
     total_turns: usize,
     terminal_width: usize,
@@ -1128,7 +1131,74 @@ fn ansi_choice(mode: ColorMode, stream: &impl IsTerminal) -> ColorChoice {
     }
 }
 
+/// Describes what a patch is doing. `with_turns` adds the turn counter, which
+/// changes on every model call and so is only useful to a display that
+/// repaints in place.
+fn status_label(p: &PatchState, with_turns: bool) -> String {
+    match &p.status {
+        PatchStatus::Queued => "Queued".to_string(),
+        PatchStatus::PreScreening => "Pre-screening guides...".to_string(),
+        PatchStatus::Planning => "Planning stages...".to_string(),
+        PatchStatus::Reviewing => {
+            if p.active_stages.is_empty() {
+                "Reviewing...".to_string()
+            } else {
+                let mut stages_with_turns: Vec<(&String, usize)> = p
+                    .active_stages
+                    .iter()
+                    .map(|st| {
+                        let turn = p.active_stage_turns.get(st).cloned().unwrap_or(0);
+                        (st, turn)
+                    })
+                    .collect();
+                stages_with_turns.sort_by(|a, b| b.1.cmp(&a.1));
+
+                let (top_stage, top_turn) = stages_with_turns[0];
+                let stage_name = stage_short_name(top_stage);
+                let stage_str = if with_turns && top_turn > 0 {
+                    format!("{} (turn {})", stage_name, top_turn)
+                } else {
+                    stage_name.to_string()
+                };
+
+                if p.active_stages.len() > 1 {
+                    format!("{} (+{} stages)", stage_str, p.active_stages.len() - 1)
+                } else {
+                    stage_str
+                }
+            }
+        }
+        PatchStatus::Finished => "Finished".to_string(),
+    }
+}
+
+/// Appends a line per patch whenever its status changes, without moving the
+/// cursor.
+///
+/// Nothing here is erased or overwritten, so the output survives being
+/// redirected: no escape sequences, and no frame that a later repaint would
+/// have to find again. The overall bar and the turn counter are dropped, both
+/// being things only a repainting display can show without a line per change.
+fn render_progress_plain(state: &mut ProgressState) {
+    for (&idx, p) in &state.patches {
+        let label = status_label(p, false);
+        if state.last_status.get(&idx) == Some(&label) {
+            continue;
+        }
+        state.last_status.insert(idx, label.clone());
+        eprintln!("      [Patch {}] {} | {}", idx, p.subject, label);
+    }
+    let _ = std::io::stderr().flush();
+}
+
 fn render_progress(state: &mut ProgressState) {
+    // The same permission as color: cursor movement is ANSI too, so a stream
+    // that may not carry it is written to a line at a time instead.
+    if state.color_choice == ColorChoice::Never {
+        render_progress_plain(state);
+        return;
+    }
+
     if state.printed_lines > 0 {
         for _ in 0..state.printed_lines {
             eprint!("\x1b[F\x1b[2K");
@@ -1140,41 +1210,7 @@ fn render_progress(state: &mut ProgressState) {
     let limit = state.terminal_width.saturating_sub(5);
 
     for (&idx, p) in &state.patches {
-        let status_str = match &p.status {
-            PatchStatus::Queued => "Queued".to_string(),
-            PatchStatus::PreScreening => "Pre-screening guides...".to_string(),
-            PatchStatus::Planning => "Planning stages...".to_string(),
-            PatchStatus::Reviewing => {
-                if p.active_stages.is_empty() {
-                    "Reviewing...".to_string()
-                } else {
-                    let mut stages_with_turns: Vec<(&String, usize)> = p
-                        .active_stages
-                        .iter()
-                        .map(|st| {
-                            let turn = p.active_stage_turns.get(st).cloned().unwrap_or(0);
-                            (st, turn)
-                        })
-                        .collect();
-                    stages_with_turns.sort_by(|a, b| b.1.cmp(&a.1));
-
-                    let (top_stage, top_turn) = stages_with_turns[0];
-                    let stage_name = stage_short_name(top_stage);
-                    let stage_str = if top_turn > 0 {
-                        format!("{} (turn {})", stage_name, top_turn)
-                    } else {
-                        stage_name.to_string()
-                    };
-
-                    if p.active_stages.len() > 1 {
-                        format!("{} (+{} stages)", stage_str, p.active_stages.len() - 1)
-                    } else {
-                        stage_str
-                    }
-                }
-            }
-            PatchStatus::Finished => "Finished".to_string(),
-        };
+        let status_str = status_label(p, true);
 
         // Calculate available width for subject to guarantee status is never truncated
         let fixed_overhead = 16 + 3; // "      [Patch X] " + " | "
@@ -1325,6 +1361,7 @@ async fn handle_review_command(
 
     let progress_state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState {
         patches: std::collections::BTreeMap::new(),
+        last_status: std::collections::BTreeMap::new(),
         printed_lines: 0,
         total_turns: 0,
         terminal_width: get_terminal_width(),
@@ -2390,6 +2427,29 @@ fn identify_subsystems_from_paths(
 mod tests {
     use super::*;
 
+    fn progress_state(color_choice: ColorChoice) -> ProgressState {
+        ProgressState {
+            patches: std::collections::BTreeMap::new(),
+            last_status: std::collections::BTreeMap::new(),
+            printed_lines: 0,
+            total_turns: 0,
+            terminal_width: 100,
+            color_choice,
+        }
+    }
+
+    fn patch_state(status: PatchStatus) -> PatchState {
+        PatchState {
+            index: 1,
+            subject: "a patch".to_string(),
+            status,
+            planned_stages: Vec::new(),
+            active_stages: std::collections::BTreeSet::new(),
+            completed_stages: 0,
+            active_stage_turns: std::collections::HashMap::new(),
+        }
+    }
+
     #[test]
     fn test_each_stream_is_asked_about_itself() {
         // std::io::IsTerminal cannot be implemented outside std, so these are
@@ -2412,6 +2472,44 @@ mod tests {
             assert_eq!(ansi_choice(ColorMode::Always, stream), ColorChoice::Always);
             assert_eq!(ansi_choice(ColorMode::Never, stream), ColorChoice::Never);
         }
+    }
+
+    #[test]
+    fn test_a_redirected_display_appends_without_moving_the_cursor() {
+        // printed_lines drives the erase loop. Left non-zero, a later repaint
+        // would walk the cursor up through whatever the log wrote in between,
+        // and there is no cursor here to walk.
+        let mut state = progress_state(ColorChoice::Never);
+        state.patches.insert(1, patch_state(PatchStatus::Queued));
+
+        render_progress(&mut state);
+        assert_eq!(state.printed_lines, 0);
+        assert_eq!(
+            state.last_status.get(&1).map(String::as_str),
+            Some("Queued")
+        );
+
+        // An unchanged status is not appended again, so a turn tick alone does
+        // not produce a line.
+        render_progress(&mut state);
+        assert_eq!(state.last_status.len(), 1);
+
+        state.patches.insert(1, patch_state(PatchStatus::Finished));
+        render_progress(&mut state);
+        assert_eq!(
+            state.last_status.get(&1).map(String::as_str),
+            Some("Finished")
+        );
+    }
+
+    #[test]
+    fn test_status_label_drops_the_turn_counter_when_not_repainting() {
+        let mut p = patch_state(PatchStatus::Reviewing);
+        p.active_stages.insert("locking".to_string());
+        p.active_stage_turns.insert("locking".to_string(), 3);
+
+        assert_eq!(status_label(&p, true), "Locking & Sync (turn 3)");
+        assert_eq!(status_label(&p, false), "Locking & Sync");
     }
 
     #[test]
