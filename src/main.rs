@@ -1118,6 +1118,16 @@ impl TruncatingWriter {
     }
 }
 
+/// Whether a stream may carry ANSI, asked of the stream itself.
+fn ansi_choice(mode: ColorMode, stream: &impl IsTerminal) -> ColorChoice {
+    match mode {
+        ColorMode::Always => ColorChoice::Always,
+        ColorMode::Never => ColorChoice::Never,
+        ColorMode::Auto if stream.is_terminal() => ColorChoice::Auto,
+        ColorMode::Auto => ColorChoice::Never,
+    }
+}
+
 fn render_progress(state: &mut ProgressState) {
     if state.printed_lines > 0 {
         for _ in 0..state.printed_lines {
@@ -1285,17 +1295,8 @@ async fn handle_review_command(
     color: ColorMode,
     stages: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let color_choice = match color {
-        ColorMode::Always => ColorChoice::Always,
-        ColorMode::Never => ColorChoice::Never,
-        ColorMode::Auto => {
-            if std::io::stdout().is_terminal() {
-                ColorChoice::Auto
-            } else {
-                ColorChoice::Never
-            }
-        }
-    };
+    let report_ansi = ansi_choice(color, &std::io::stdout());
+    let display_ansi = ansi_choice(color, &std::io::stderr());
 
     let repo_path = current_git_toplevel()?;
     eprintln!("Reviewing: {}", input);
@@ -1305,7 +1306,7 @@ async fn handle_review_command(
         .await
         .unwrap_or(false)
     {
-        eprint_colored(color_choice, Color::Yellow, "WARNING:")?;
+        eprint_colored(display_ansi, Color::Yellow, "WARNING:")?;
         eprintln!(
             " Working directory is dirty. The AI reviewer might see uncommitted changes when analyzing files."
         );
@@ -1327,7 +1328,7 @@ async fn handle_review_command(
         printed_lines: 0,
         total_turns: 0,
         terminal_width: get_terminal_width(),
-        color_choice,
+        color_choice: display_ansi,
     }));
 
     let progress_state_clone = progress_state.clone();
@@ -1472,7 +1473,7 @@ async fn handle_review_command(
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         OutputFormat::Text => {
-            print_review_result(&result, &input, color_choice)?;
+            print_review_result(&result, &input, report_ansi)?;
         }
     }
 
@@ -2388,6 +2389,30 @@ fn identify_subsystems_from_paths(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_each_stream_is_asked_about_itself() {
+        // std::io::IsTerminal cannot be implemented outside std, so these are
+        // real descriptors: a pty master answers yes, /dev/null answers no.
+        let terminal = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let redirected = std::fs::File::open("/dev/null").expect("open /dev/null");
+
+        // "auto" is the only mode that asks a stream anything, and it asks the
+        // one it was handed: a redirected stdout must not silence stderr.
+        assert_eq!(ansi_choice(ColorMode::Auto, &terminal), ColorChoice::Auto);
+        assert_eq!(
+            ansi_choice(ColorMode::Auto, &redirected),
+            ColorChoice::Never
+        );
+
+        // "always" and "never" are answers about the run, so the stream does
+        // not get a say. This is what makes "--color always" work under a
+        // Docker pipe, where the escapes reach the terminal but isatty says no.
+        for stream in [&terminal, &redirected] {
+            assert_eq!(ansi_choice(ColorMode::Always, stream), ColorChoice::Always);
+            assert_eq!(ansi_choice(ColorMode::Never, stream), ColorChoice::Never);
+        }
+    }
 
     #[test]
     fn test_progress_metrics_clamp_completed_stages_to_total() {
