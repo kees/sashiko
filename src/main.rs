@@ -31,6 +31,7 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -1238,6 +1239,65 @@ fn window_size(stream: &impl AsFd) -> Option<(usize, usize)> {
     Some((size.ws_row as usize, size.ws_col as usize))
 }
 
+/// Keeps the display's idea of the terminal width current for as long as the
+/// review runs, and repaints at the new width as soon as it changes.
+///
+/// A window that is resized leaves every line the display drew wrapped to a
+/// width the terminal no longer has, and SIGWINCH is the only notice of it: the
+/// size has to be asked for again. Does nothing where stderr has no window,
+/// there being no size to follow.
+///
+/// The repaint arrives as an argument rather than being called outright, so that
+/// a test can watch a resize reach the display without a frame being painted at
+/// the terminal running the test.
+fn watch_for_resize(
+    state: Arc<std::sync::Mutex<ProgressState>>,
+    stream: impl AsFd + Send + 'static,
+    mut repaint: impl FnMut(&mut ProgressState) + Send + 'static,
+) -> Option<tokio::task::JoinHandle<()>> {
+    window_size(&stream)?;
+
+    let mut resized = match signal(SignalKind::window_change()) {
+        Ok(resized) => resized,
+        Err(e) => {
+            warn!("Progress display cannot follow the terminal size: {}", e);
+            return None;
+        }
+    };
+
+    // The size this display started from was read before the listener above
+    // existed, and a resize in between is a resize nothing will report again.
+    // Ask once here, so the gap is closed rather than waited out.
+    {
+        let mut state = state.lock().unwrap();
+        if let Some((_, cols)) = window_size(&stream)
+            && state.terminal_width != cols
+        {
+            state.terminal_width = cols;
+            repaint(&mut state);
+        }
+    }
+
+    Some(tokio::spawn(async move {
+        while resized.recv().await.is_some() {
+            // The signal is delivered to the process, not to a stream, so it
+            // says only that something was resized. Ask what this stream is now
+            // and let the answer decide: a wake that leaves the width where it
+            // was has nothing to redraw for.
+            let Some((_, cols)) = window_size(&stream) else {
+                continue;
+            };
+
+            let mut state = state.lock().unwrap();
+            if state.terminal_width == cols {
+                continue;
+            }
+            state.terminal_width = cols;
+            repaint(&mut state);
+        }
+    }))
+}
+
 struct ProgressState {
     project: ProjectId,
     patches: std::collections::BTreeMap<i64, PatchState>,
@@ -1777,6 +1837,14 @@ async fn handle_review_command(
         }
     };
 
+    // Only a display that draws again has a width to be wrong about: appended
+    // lines are never drawn twice.
+    let resize = if display.cursor_capable {
+        watch_for_resize(progress_state.clone(), std::io::stderr(), render_progress)
+    } else {
+        None
+    };
+
     let result = run_git_review(
         repo_path,
         input.clone(),
@@ -1793,6 +1861,10 @@ async fn handle_review_command(
         Some(&progress),
     )
     .await?;
+
+    if let Some(resize) = resize {
+        resize.abort();
+    }
 
     match format {
         OutputFormat::Json => {
@@ -2850,6 +2922,114 @@ mod tests {
             cursor_capable: false,
             size,
         }
+    }
+
+    /// Sets a pty's window size, the way a terminal emulator does for the pty
+    /// it owns.
+    fn resize(pty: &std::fs::File, rows: u16, cols: u16) {
+        rustix::termios::tcsetwinsize(
+            pty,
+            rustix::termios::Winsize {
+                ws_row: rows,
+                ws_col: cols,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )
+        .expect("set the pty window size");
+    }
+
+    #[tokio::test]
+    async fn test_a_resize_is_followed_while_the_review_runs() {
+        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        resize(&pty, 24, 80);
+
+        let state = Arc::new(std::sync::Mutex::new(progress_state(repainting((24, 80)))));
+
+        // Counted rather than painted: a frame painted here would be written to
+        // the terminal running the test, and escape sequences left there outlive
+        // the run.
+        let painted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = painted.clone();
+        let watching = watch_for_resize(
+            state.clone(),
+            pty.try_clone().expect("dup the pty"),
+            move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .expect("follow a terminal that has a size");
+
+        // What a terminal emulator does: change the window, then say so.
+        resize(&pty, 24, 132);
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::WINCH)
+            .expect("signal ourselves");
+
+        // The signal is delivered to the task, so give it a chance to run.
+        for _ in 0..200 {
+            if state.lock().unwrap().terminal_width == 132 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            state.lock().unwrap().terminal_width,
+            132,
+            "the display kept drawing to the old width"
+        );
+
+        // And it is drawn again at that width, rather than waiting for whatever
+        // the review does next.
+        assert_eq!(painted.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // A signal that leaves the width where it is redraws nothing. SIGWINCH
+        // reaches the whole process, so a listener that repainted for every one
+        // of them would repaint for windows that are not this stream.
+        rustix::process::kill_process(rustix::process::getpid(), rustix::process::Signal::WINCH)
+            .expect("signal ourselves");
+        for _ in 0..20 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(painted.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        watching.abort();
+    }
+
+    #[tokio::test]
+    async fn test_a_resize_between_starting_and_listening_is_not_missed() {
+        // The display starts from the size it was given, and the window changes
+        // before anything is listening for the signal that says so.
+        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        resize(&pty, 24, 80);
+        let state = Arc::new(std::sync::Mutex::new(progress_state(repainting((24, 80)))));
+        resize(&pty, 24, 132);
+
+        // No signal is raised here: that one is gone. Registering asks for the
+        // size itself, so the display is drawing to the window as it now is.
+        let painted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = painted.clone();
+        let watching = watch_for_resize(
+            state.clone(),
+            pty.try_clone().expect("dup the pty"),
+            move |_| {
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            },
+        )
+        .expect("follow a terminal that has a size");
+
+        assert_eq!(state.lock().unwrap().terminal_width, 132);
+        assert_eq!(painted.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        watching.abort();
+    }
+
+    #[tokio::test]
+    async fn test_a_stream_with_no_window_is_not_followed() {
+        // Nothing to follow: no size to ask for, and no terminal to resize.
+        let redirected = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let state = Arc::new(std::sync::Mutex::new(progress_state(repainting((24, 80)))));
+
+        assert!(watch_for_resize(state, redirected, render_progress).is_none());
     }
 
     #[test]
