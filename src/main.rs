@@ -27,6 +27,7 @@ use sashiko::settings::Settings;
 use serde_json::Value;
 use std::io::IsTerminal;
 use std::io::Write;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
@@ -1313,6 +1314,28 @@ impl TruncatingWriter {
     }
 }
 
+/// What one of the streams a review writes to can do. Asked of the stream
+/// itself, since redirecting one says nothing about the other.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct OutputStream {
+    color: ColorChoice,
+}
+
+impl OutputStream {
+    fn detect(mode: ColorMode, stream: &impl AsFd) -> Self {
+        // "always" and "never" answer for the run rather than for a stream, so
+        // only "auto" asks the stream anything.
+        let color = match mode {
+            ColorMode::Always => ColorChoice::Always,
+            ColorMode::Never => ColorChoice::Never,
+            ColorMode::Auto if stream.as_fd().is_terminal() => ColorChoice::Auto,
+            ColorMode::Auto => ColorChoice::Never,
+        };
+
+        Self { color }
+    }
+}
+
 /// Paints a frame to stderr, where the progress display lives, in one write.
 fn render_progress(state: &mut ProgressState) {
     let stderr = BufferWriter::stderr(state.color_choice);
@@ -1491,17 +1514,10 @@ async fn handle_review_command(
     color: ColorMode,
     stages: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let color_choice = match color {
-        ColorMode::Always => ColorChoice::Always,
-        ColorMode::Never => ColorChoice::Never,
-        ColorMode::Auto => {
-            if std::io::stdout().is_terminal() {
-                ColorChoice::Auto
-            } else {
-                ColorChoice::Never
-            }
-        }
-    };
+    // The report goes to stdout and the progress display to stderr, and what one
+    // of them can do says nothing about the other.
+    let report = OutputStream::detect(color, &std::io::stdout());
+    let display = OutputStream::detect(color, &std::io::stderr());
 
     let repo_path = current_git_toplevel()?;
     if project.uses_maintainers()
@@ -1517,7 +1533,7 @@ async fn handle_review_command(
         .await
         .unwrap_or(false)
     {
-        eprint_colored(color_choice, Color::Yellow, "WARNING:")?;
+        eprint_colored(display.color, Color::Yellow, "WARNING:")?;
         eprintln!(
             " Working directory is dirty. The AI reviewer might see uncommitted changes when analyzing files."
         );
@@ -1540,7 +1556,7 @@ async fn handle_review_command(
         printed_lines: 0,
         total_turns: 0,
         terminal_width: get_terminal_width(),
-        color_choice,
+        color_choice: display.color,
     }));
 
     let progress_state_clone = progress_state.clone();
@@ -1686,7 +1702,7 @@ async fn handle_review_command(
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         OutputFormat::Text => {
-            print_review_result(&result, &input, color_choice)?;
+            print_review_result(&result, &input, report.color)?;
         }
     }
 
@@ -2686,6 +2702,39 @@ fn should_start_nntp_ingestor(settings: &Settings) -> bool {
 mod tests {
     use super::*;
     use termcolor::Buffer;
+
+    #[test]
+    fn test_each_stream_is_asked_about_itself() {
+        // std::io::IsTerminal cannot be implemented outside std, so these are
+        // real descriptors: a pty master answers yes, /dev/null answers no.
+        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let redirected = std::fs::File::open("/dev/null").expect("open /dev/null");
+
+        // "auto" is the only mode that asks a stream anything, and it asks the
+        // one it was handed: a redirected stdout must not silence stderr.
+        assert_eq!(
+            OutputStream::detect(ColorMode::Auto, &pty).color,
+            ColorChoice::Auto
+        );
+        assert_eq!(
+            OutputStream::detect(ColorMode::Auto, &redirected).color,
+            ColorChoice::Never
+        );
+
+        // "always" and "never" are answers about the run, so the stream gets no
+        // say. This is what makes "--color always" work under a Docker pipe,
+        // where the escapes reach the terminal but isatty says no.
+        for stream in [&pty, &redirected] {
+            assert_eq!(
+                OutputStream::detect(ColorMode::Always, stream).color,
+                ColorChoice::Always
+            );
+            assert_eq!(
+                OutputStream::detect(ColorMode::Never, stream).color,
+                ColorChoice::Never
+            );
+        }
+    }
 
     #[test]
     fn test_a_frame_erases_the_one_before_it() {
