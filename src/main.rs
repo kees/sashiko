@@ -1314,6 +1314,18 @@ impl TruncatingWriter {
     }
 }
 
+/// Whether the terminal `info` describes has any color to set.
+///
+/// isatty says that a stream is a terminal, not what kind of one: vt100 and
+/// xterm-mono are terminals with no color at all, and the SGR codes a review
+/// would paint at them are at best ignored. terminfo answers it properly, as the
+/// number of colors the terminal has and the string that selects one.
+fn color_capable(info: &terminfo::Database) -> bool {
+    info.get::<terminfo::capability::MaxColors>()
+        .is_some_and(|colors| colors.0 >= 8)
+        && info.get::<terminfo::capability::SetAForeground>().is_some()
+}
+
 /// What one of the streams a review writes to can do. Asked of the stream
 /// itself, since redirecting one says nothing about the other.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1322,13 +1334,25 @@ struct OutputStream {
 }
 
 impl OutputStream {
-    fn detect(mode: ColorMode, stream: &impl AsFd) -> Self {
+    /// `terminal` describes what TERM names, or nothing where TERM names
+    /// something terminfo does not know: a stream can only do what both it and
+    /// the terminal behind it can.
+    fn detect(mode: ColorMode, stream: &impl AsFd, terminal: Option<&terminfo::Database>) -> Self {
+        let colored = match terminal {
+            Some(info) => color_capable(info),
+            // Default to color capable if terminfo is missing and TERM is set to
+            // anything other than "dumb".
+            None => std::env::var("TERM").is_ok_and(|term| !term.is_empty() && term != "dumb"),
+        };
+
         // "always" and "never" answer for the run rather than for a stream, so
-        // only "auto" asks the stream anything.
+        // only "auto" asks the stream or the terminal anything. A stream that is
+        // no terminal has no terminal behind it to ask, so it gets no color
+        // whatever TERM says.
         let color = match mode {
             ColorMode::Always => ColorChoice::Always,
             ColorMode::Never => ColorChoice::Never,
-            ColorMode::Auto if stream.as_fd().is_terminal() => ColorChoice::Auto,
+            ColorMode::Auto if stream.as_fd().is_terminal() && colored => ColorChoice::Auto,
             ColorMode::Auto => ColorChoice::Never,
         };
 
@@ -1515,9 +1539,11 @@ async fn handle_review_command(
     stages: Option<Vec<String>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // The report goes to stdout and the progress display to stderr, and what one
-    // of them can do says nothing about the other.
-    let report = OutputStream::detect(color, &std::io::stdout());
-    let display = OutputStream::detect(color, &std::io::stderr());
+    // of them can do says nothing about the other. TERM describes the terminal
+    // rather than either stream, so both are asked against the one description.
+    let terminal = terminfo::Database::from_env().ok();
+    let report = OutputStream::detect(color, &std::io::stdout(), terminal.as_ref());
+    let display = OutputStream::detect(color, &std::io::stderr(), terminal.as_ref());
 
     let repo_path = current_git_toplevel()?;
     if project.uses_maintainers()
@@ -2703,36 +2729,86 @@ mod tests {
     use super::*;
     use termcolor::Buffer;
 
+    /// The terminfo entry for `term`, where this machine has one.
+    ///
+    /// Sashiko builds and tests in environments that may have no terminfo
+    /// database at all, so we fall back to empty instead of failing.
+    fn terminfo_for(term: &str) -> Option<terminfo::Database> {
+        terminfo::Database::from_name(term).ok()
+    }
+
     #[test]
     fn test_each_stream_is_asked_about_itself() {
         // std::io::IsTerminal cannot be implemented outside std, so these are
         // real descriptors: a pty master answers yes, /dev/null answers no.
         let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
         let redirected = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let xterm = terminfo_for("xterm");
 
         // "auto" is the only mode that asks a stream anything, and it asks the
-        // one it was handed: a redirected stdout must not silence stderr.
+        // one it was handed: a redirected stdout must not silence stderr. Said of
+        // a terminal that has color, where this machine can describe one.
+        if let Some(xterm) = xterm.as_ref() {
+            assert_eq!(
+                OutputStream::detect(ColorMode::Auto, &pty, Some(xterm)).color,
+                ColorChoice::Auto
+            );
+        }
+
+        // A stream that is no terminal gets no color from a terminal that has
+        // it: TERM describes the screen someone may be looking at, not the file
+        // this stream was redirected to.
         assert_eq!(
-            OutputStream::detect(ColorMode::Auto, &pty).color,
-            ColorChoice::Auto
-        );
-        assert_eq!(
-            OutputStream::detect(ColorMode::Auto, &redirected).color,
+            OutputStream::detect(ColorMode::Auto, &redirected, xterm.as_ref()).color,
             ColorChoice::Never
         );
 
-        // "always" and "never" are answers about the run, so the stream gets no
-        // say. This is what makes "--color always" work under a Docker pipe,
-        // where the escapes reach the terminal but isatty says no.
+        // "always" and "never" are answers about the run, so neither the stream
+        // nor the terminal gets a say. This is what makes "--color always" work
+        // under a Docker pipe, where the escapes reach the terminal but isatty
+        // says no.
         for stream in [&pty, &redirected] {
             assert_eq!(
-                OutputStream::detect(ColorMode::Always, stream).color,
+                OutputStream::detect(ColorMode::Always, stream, None).color,
                 ColorChoice::Always
             );
             assert_eq!(
-                OutputStream::detect(ColorMode::Never, stream).color,
+                OutputStream::detect(ColorMode::Never, stream, xterm.as_ref()).color,
                 ColorChoice::Never
             );
+        }
+    }
+
+    #[test]
+    fn test_color_is_the_terminals_answer_and_not_isattys() {
+        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+
+        // A terminal with no color to set. isatty cannot tell this apart from an
+        // xterm, and terminfo can.
+        assert!(pty.is_terminal());
+        if let Some(vt100) = terminfo_for("vt100") {
+            assert_eq!(
+                OutputStream::detect(ColorMode::Auto, &pty, Some(&vt100)).color,
+                ColorChoice::Never
+            );
+        }
+
+        // Which terminals have color, straight from the database, for those of
+        // them this machine has: a build environment carrying no terminfo at all
+        // is a thing this has to work on, so it is a thing the test runs on.
+        for (term, color) in [
+            ("xterm", true),
+            ("xterm-256color", true),
+            ("linux", true),
+            ("screen", true),
+            ("ansi", true),
+            ("vt100", false),
+            ("xterm-mono", false),
+            ("dumb", false),
+        ] {
+            if let Some(info) = terminfo_for(term) {
+                assert_eq!(color_capable(&info), color, "{term}");
+            }
         }
     }
 
