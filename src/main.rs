@@ -29,7 +29,7 @@ use std::io::IsTerminal;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use termcolor::{Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -1265,20 +1265,16 @@ fn stage_short_name(project: ProjectId, stage: &str) -> &'static str {
 struct TruncatingWriter {
     limit: usize,
     written: usize,
-    color_choice: ColorChoice,
 }
 
 impl TruncatingWriter {
-    fn new(limit: usize, color_choice: ColorChoice) -> Self {
-        Self {
-            limit,
-            written: 0,
-            color_choice,
-        }
+    fn new(limit: usize) -> Self {
+        Self { limit, written: 0 }
     }
 
     fn write_segment(
         &mut self,
+        out: &mut impl WriteColor,
         text: &str,
         color: Option<Color>,
         bold: bool,
@@ -1295,7 +1291,6 @@ impl TruncatingWriter {
             (text.to_string(), "")
         };
 
-        let mut stderr = StandardStream::stderr(self.color_choice);
         let mut spec = ColorSpec::new();
         if let Some(c) = color {
             spec.set_fg(Some(c));
@@ -1303,27 +1298,38 @@ impl TruncatingWriter {
         if bold {
             spec.set_bold(true);
         }
-        stderr.set_color(&spec)?;
-        write!(&mut stderr, "{}", to_write)?;
+        out.set_color(&spec)?;
+        write!(out, "{}", to_write)?;
 
         self.written += to_write.chars().count();
 
         if !suffix.is_empty() {
-            stderr.reset()?;
-            write!(&mut stderr, "{}", suffix)?;
+            out.reset()?;
+            write!(out, "{}", suffix)?;
             self.written += 3;
         }
 
-        stderr.reset()
+        out.reset()
     }
 }
 
+/// Paints a frame to stderr, where the progress display lives, in one write.
 fn render_progress(state: &mut ProgressState) {
-    if state.printed_lines > 0 {
-        for _ in 0..state.printed_lines {
-            eprint!("\x1b[F\x1b[2K");
-        }
-        let _ = std::io::stderr().flush();
+    let stderr = BufferWriter::stderr(state.color_choice);
+    let mut frame = stderr.buffer();
+    if paint_progress(state, &mut frame).is_ok() {
+        let _ = stderr.print(&frame);
+    }
+}
+
+/// Paints one frame into `out`, erasing the frame before it.
+///
+/// Every byte the display produces goes here, stderr included, so what a frame
+/// is can be asked of a buffer rather than of a terminal. Nothing in this
+/// function knows which stream it draws on.
+fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::io::Result<()> {
+    for _ in 0..state.printed_lines {
+        write!(out, "\x1b[F\x1b[2K")?;
     }
 
     let mut lines_printed = 0;
@@ -1392,10 +1398,10 @@ fn render_progress(state: &mut ProgressState) {
             subject_padded.push_str(&" ".repeat(padding_chars));
         }
 
-        let mut tw = TruncatingWriter::new(limit, state.color_choice);
-        let _ = tw.write_segment(&format!("      [Patch {}] ", idx), None, false);
-        let _ = tw.write_segment(&subject_padded, None, false);
-        let _ = tw.write_segment(" | ", None, false);
+        let mut tw = TruncatingWriter::new(limit);
+        let _ = tw.write_segment(out, &format!("      [Patch {}] ", idx), None, false);
+        let _ = tw.write_segment(out, &subject_padded, None, false);
+        let _ = tw.write_segment(out, " | ", None, false);
 
         let (status_color, status_bold) = match &p.status {
             PatchStatus::Queued => (None, false),
@@ -1403,9 +1409,9 @@ fn render_progress(state: &mut ProgressState) {
             PatchStatus::Reviewing => (Some(Color::Cyan), true),
             PatchStatus::Finished => (Some(Color::Green), true),
         };
-        let _ = tw.write_segment(&status_str, status_color, status_bold);
+        let _ = tw.write_segment(out, &status_str, status_color, status_bold);
 
-        eprintln!();
+        writeln!(out)?;
         lines_printed += 1;
     }
 
@@ -1430,29 +1436,29 @@ fn render_progress(state: &mut ProgressState) {
         let (display_completed_stages, percent, filled) =
             calculate_progress_metrics(total_stages, completed_stages, width);
 
-        let mut tw = TruncatingWriter::new(limit, state.color_choice);
-        let _ = tw.write_segment("Overall: [", None, true);
+        let mut tw = TruncatingWriter::new(limit);
+        let _ = tw.write_segment(out, "Overall: [", None, true);
 
         let filled_bar = "█".repeat(filled);
-        let _ = tw.write_segment(&filled_bar, Some(Color::Green), false);
+        let _ = tw.write_segment(out, &filled_bar, Some(Color::Green), false);
 
         let empty_bar = "░".repeat(width.saturating_sub(filled));
-        let _ = tw.write_segment(&empty_bar, None, false);
+        let _ = tw.write_segment(out, &empty_bar, None, false);
 
-        let _ = tw.write_segment("] ", None, true);
+        let _ = tw.write_segment(out, "] ", None, true);
 
         let stats = format!(
             "{}% | {}/{} stages | {} turns",
             percent, display_completed_stages, total_stages, state.total_turns
         );
-        let _ = tw.write_segment(&stats, None, false);
+        let _ = tw.write_segment(out, &stats, None, false);
 
-        eprintln!();
+        writeln!(out)?;
         lines_printed += 1;
     }
 
     state.printed_lines = lines_printed;
-    let _ = std::io::stderr().flush();
+    out.flush()
 }
 
 fn calculate_progress_metrics(
@@ -2679,6 +2685,50 @@ fn should_start_nntp_ingestor(settings: &Settings) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use termcolor::Buffer;
+
+    #[test]
+    fn test_a_frame_erases_the_one_before_it() {
+        let mut state = ProgressState {
+            patches: std::collections::BTreeMap::new(),
+            printed_lines: 0,
+            total_turns: 0,
+            terminal_width: 100,
+            color_choice: ColorChoice::Never,
+        };
+        state.patches.insert(
+            1,
+            PatchState {
+                index: 1,
+                subject: "a patch".to_string(),
+                status: PatchStatus::Queued,
+                planned_stages: Vec::new(),
+                active_stages: std::collections::BTreeSet::new(),
+                completed_stages: 0,
+                active_stage_turns: std::collections::HashMap::new(),
+            },
+        );
+
+        // One line for the patch and one for the overall bar. The first frame
+        // erases nothing, there being nothing on screen yet.
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("paint a frame");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert!(!painted.contains("\x1b[F"), "erased something: {painted:?}");
+        assert!(painted.contains("[Patch 1] a patch"));
+        assert!(painted.contains("Overall: ["));
+        assert_eq!(state.printed_lines, 2);
+
+        // The next one walks back over both of those lines and clears each.
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("paint a frame");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert!(
+            painted.starts_with("\x1b[F\x1b[2K\x1b[F\x1b[2K"),
+            "{painted:?}"
+        );
+        assert_eq!(state.printed_lines, 2);
+    }
 
     #[test]
     fn test_progress_metrics_clamp_completed_stages_to_total() {
