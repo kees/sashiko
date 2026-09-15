@@ -1251,10 +1251,15 @@ fn get_terminal_width() -> usize {
 struct ProgressState {
     project: ProjectId,
     patches: std::collections::BTreeMap<i64, PatchState>,
+    /// The status each patch was last reported with, so the appending display
+    /// speaks only when one of them changes.
+    last_status: std::collections::BTreeMap<i64, String>,
     printed_lines: usize,
     total_turns: usize,
     terminal_width: usize,
     color_choice: ColorChoice,
+    /// Whether the frame may be drawn over, or has to be appended to.
+    cursor_capable: bool,
 }
 
 /// Display label for a stage. Held in the stage tables so that adding a stage
@@ -1326,11 +1331,24 @@ fn color_capable(info: &terminfo::Database) -> bool {
         && info.get::<terminfo::capability::SetAForeground>().is_some()
 }
 
+/// Whether the terminal `info` describes can be drawn over: cursor_up to walk
+/// back over the last frame, and clr_eol to take each line of it away.
+///
+/// A separate question from color, with a separate answer: a vt100 has every
+/// cursor capability and no color at all, while a dumb terminal has neither.
+fn cursor_capable(info: &terminfo::Database) -> bool {
+    info.get::<terminfo::capability::CursorUp>().is_some()
+        && info.get::<terminfo::capability::ClrEol>().is_some()
+}
+
 /// What one of the streams a review writes to can do. Asked of the stream
 /// itself, since redirecting one says nothing about the other.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct OutputStream {
     color: ColorChoice,
+    /// Whether the progress display may draw over its own frame here, rather
+    /// than appending a line at a time.
+    cursor_capable: bool,
 }
 
 impl OutputStream {
@@ -1349,14 +1367,26 @@ impl OutputStream {
         // only "auto" asks the stream or the terminal anything. A stream that is
         // no terminal has no terminal behind it to ask, so it gets no color
         // whatever TERM says.
-        let color = match mode {
-            ColorMode::Always => ColorChoice::Always,
-            ColorMode::Never => ColorChoice::Never,
-            ColorMode::Auto if stream.as_fd().is_terminal() && colored => ColorChoice::Auto,
-            ColorMode::Auto => ColorChoice::Never,
+        let (color, cursor_capable) = match mode {
+            // Forcing color asserts that the escapes arrive whatever isatty
+            // says, cursor movement among them.
+            ColorMode::Always => (ColorChoice::Always, true),
+            ColorMode::Never => (ColorChoice::Never, false),
+            ColorMode::Auto if stream.as_fd().is_terminal() => (
+                if colored {
+                    ColorChoice::Auto
+                } else {
+                    ColorChoice::Never
+                },
+                terminal.is_some_and(cursor_capable),
+            ),
+            ColorMode::Auto => (ColorChoice::Never, false),
         };
 
-        Self { color }
+        Self {
+            color,
+            cursor_capable,
+        }
     }
 }
 
@@ -1369,12 +1399,89 @@ fn render_progress(state: &mut ProgressState) {
     }
 }
 
+/// Describes what a patch is doing. `with_turns` adds the turn counter, which
+/// changes on every model call and so is only of use to a display that draws
+/// over what it said last.
+fn status_label(project: ProjectId, p: &PatchState, with_turns: bool) -> String {
+    match &p.status {
+        PatchStatus::Queued => "Queued".to_string(),
+        PatchStatus::PreScreening => "Pre-screening guides...".to_string(),
+        PatchStatus::Planning => "Planning stages...".to_string(),
+        PatchStatus::Reviewing => {
+            if p.active_stages.is_empty() {
+                "Reviewing...".to_string()
+            } else {
+                // A repainting frame leads with the busiest stage, the turn
+                // counter beside it saying why that one. Dropping the counter has
+                // to drop that order with it: a stage overtaking another would
+                // otherwise change the line for a reason the reader cannot see,
+                // and an appending display would say the whole line again. Where
+                // the counter is hidden, and among stages tied on it, the set's
+                // own order decides, which changes only when the set does.
+                let busiest = |stage: &String| {
+                    let turns = p.active_stage_turns.get(stage).copied().unwrap_or(0);
+                    std::cmp::Reverse(if with_turns { turns } else { 0 })
+                };
+                let top_stage = p
+                    .active_stages
+                    .iter()
+                    .min_by_key(|stage| busiest(stage))
+                    .expect("a stage, the set is not empty");
+                let top_turn = p.active_stage_turns.get(top_stage).copied().unwrap_or(0);
+                let stage_name = stage_short_name(project, top_stage);
+                let stage_str = if with_turns && top_turn > 0 {
+                    format!("{} (turn {})", stage_name, top_turn)
+                } else {
+                    stage_name.to_string()
+                };
+
+                if p.active_stages.len() > 1 {
+                    format!("{} (+{} stages)", stage_str, p.active_stages.len() - 1)
+                } else {
+                    stage_str
+                }
+            }
+        }
+        PatchStatus::Finished => "Finished".to_string(),
+    }
+}
+
+/// Appends a line per patch whenever its status changes, without moving the
+/// cursor.
+///
+/// Nothing is erased or overwritten, so the output survives a terminal that
+/// cannot be drawn over, and survives being redirected: no escape sequences, and
+/// no frame a later repaint would have to find again. The overall bar and the
+/// turn counter are dropped, both being things only a repainting display can
+/// show without a line per change.
+fn paint_progress_plain(
+    state: &mut ProgressState,
+    out: &mut impl WriteColor,
+) -> std::io::Result<()> {
+    for (&idx, p) in &state.patches {
+        let label = status_label(state.project, p, false);
+        if state.last_status.get(&idx) == Some(&label) {
+            continue;
+        }
+        state.last_status.insert(idx, label.clone());
+        writeln!(out, "      [Patch {}] {} | {}", idx, p.subject, label)?;
+    }
+
+    out.flush()
+}
+
 /// Paints one frame into `out`, erasing the frame before it.
 ///
 /// Every byte the display produces goes here, stderr included, so what a frame
 /// is can be asked of a buffer rather than of a terminal. Nothing in this
 /// function knows which stream it draws on.
 fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::io::Result<()> {
+    // Walking back over the last frame needs a terminal that can be walked back
+    // over. Where it cannot, the display says its piece a line at a time.
+    if !state.cursor_capable {
+        return paint_progress_plain(state, out);
+    }
+
     for _ in 0..state.printed_lines {
         write!(out, "\x1b[F\x1b[2K")?;
     }
@@ -1383,41 +1490,7 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
     let limit = state.terminal_width.saturating_sub(5);
 
     for (&idx, p) in &state.patches {
-        let status_str = match &p.status {
-            PatchStatus::Queued => "Queued".to_string(),
-            PatchStatus::PreScreening => "Pre-screening guides...".to_string(),
-            PatchStatus::Planning => "Planning stages...".to_string(),
-            PatchStatus::Reviewing => {
-                if p.active_stages.is_empty() {
-                    "Reviewing...".to_string()
-                } else {
-                    let mut stages_with_turns: Vec<(&String, usize)> = p
-                        .active_stages
-                        .iter()
-                        .map(|st| {
-                            let turn = p.active_stage_turns.get(st).cloned().unwrap_or(0);
-                            (st, turn)
-                        })
-                        .collect();
-                    stages_with_turns.sort_by_key(|a| std::cmp::Reverse(a.1));
-
-                    let (top_stage, top_turn) = stages_with_turns[0];
-                    let stage_name = stage_short_name(state.project, top_stage);
-                    let stage_str = if top_turn > 0 {
-                        format!("{} (turn {})", stage_name, top_turn)
-                    } else {
-                        stage_name.to_string()
-                    };
-
-                    if p.active_stages.len() > 1 {
-                        format!("{} (+{} stages)", stage_str, p.active_stages.len() - 1)
-                    } else {
-                        stage_str
-                    }
-                }
-            }
-            PatchStatus::Finished => "Finished".to_string(),
-        };
+        let status_str = status_label(state.project, p, true);
 
         // Calculate available width for subject to guarantee status is never truncated
         let fixed_overhead = 16 + 3; // "      [Patch X] " + " | "
@@ -1581,8 +1654,10 @@ async fn handle_review_command(
         patches: std::collections::BTreeMap::new(),
         printed_lines: 0,
         total_turns: 0,
+        last_status: std::collections::BTreeMap::new(),
         terminal_width: get_terminal_width(),
         color_choice: display.color,
+        cursor_capable: display.cursor_capable,
     }));
 
     let progress_state_clone = progress_state.clone();
@@ -2737,6 +2812,48 @@ mod tests {
         terminfo::Database::from_name(term).ok()
     }
 
+    fn progress_state(display: OutputStream) -> ProgressState {
+        ProgressState {
+            project: ProjectId::Linux,
+            patches: std::collections::BTreeMap::new(),
+            last_status: std::collections::BTreeMap::new(),
+            printed_lines: 0,
+            total_turns: 0,
+            terminal_width: 100,
+            color_choice: display.color,
+            cursor_capable: display.cursor_capable,
+        }
+    }
+
+    fn patch_state(status: PatchStatus) -> PatchState {
+        PatchState {
+            index: 1,
+            subject: "a patch".to_string(),
+            status,
+            planned_stages: Vec::new(),
+            active_stages: std::collections::BTreeSet::new(),
+            completed_stages: 0,
+            active_stage_turns: std::collections::HashMap::new(),
+        }
+    }
+
+    /// A stream the display may draw over, with no color: what a vt100 answers,
+    /// and what keeps a painted frame out of the test output.
+    fn repainting() -> OutputStream {
+        OutputStream {
+            color: ColorChoice::Never,
+            cursor_capable: true,
+        }
+    }
+
+    /// A stream the display is told about each change on.
+    fn appending() -> OutputStream {
+        OutputStream {
+            color: ColorChoice::Never,
+            cursor_capable: false,
+        }
+    }
+
     #[test]
     fn test_each_stream_is_asked_about_itself() {
         // std::io::IsTerminal cannot be implemented outside std, so these are
@@ -2814,25 +2931,8 @@ mod tests {
 
     #[test]
     fn test_a_frame_erases_the_one_before_it() {
-        let mut state = ProgressState {
-            patches: std::collections::BTreeMap::new(),
-            printed_lines: 0,
-            total_turns: 0,
-            terminal_width: 100,
-            color_choice: ColorChoice::Never,
-        };
-        state.patches.insert(
-            1,
-            PatchState {
-                index: 1,
-                subject: "a patch".to_string(),
-                status: PatchStatus::Queued,
-                planned_stages: Vec::new(),
-                active_stages: std::collections::BTreeSet::new(),
-                completed_stages: 0,
-                active_stage_turns: std::collections::HashMap::new(),
-            },
-        );
+        let mut state = progress_state(repainting());
+        state.patches.insert(1, patch_state(PatchStatus::Queued));
 
         // One line for the patch and one for the overall bar. The first frame
         // erases nothing, there being nothing on screen yet.
@@ -2853,6 +2953,136 @@ mod tests {
             "{painted:?}"
         );
         assert_eq!(state.printed_lines, 2);
+    }
+
+    #[test]
+    fn test_a_terminal_that_cannot_be_drawn_over_gets_appended_lines() {
+        let mut state = progress_state(appending());
+        state.patches.insert(1, patch_state(PatchStatus::Queued));
+
+        // Nothing is erased and no escape sequence is written, so the output
+        // survives a terminal that cannot move its cursor and a file that has no
+        // terminal at all. printed_lines stays zero: left set, a later frame
+        // would walk the cursor up through whatever the log wrote in between.
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("append a line");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert_eq!(painted, "      [Patch 1] a patch | Queued\n");
+        assert_eq!(state.printed_lines, 0);
+        assert_eq!(
+            state.last_status.get(&1).map(String::as_str),
+            Some("Queued")
+        );
+
+        // A status that has not changed is not said again: the appending display
+        // speaks only when something does change.
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("append nothing");
+        assert!(frame.into_inner().is_empty());
+
+        state.patches.insert(1, patch_state(PatchStatus::Finished));
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("append a line");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert_eq!(painted, "      [Patch 1] a patch | Finished\n");
+    }
+
+    #[test]
+    fn test_drawing_over_the_frame_is_the_terminals_answer_too() {
+        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        let over = |info: &terminfo::Database| {
+            OutputStream::detect(ColorMode::Auto, &pty, Some(info)).cursor_capable
+        };
+
+        // A vt100 can be drawn over and has no color, so it is repainted without
+        // any: the two answers are separate, and neither is read off the other.
+        for term in ["xterm", "linux", "screen", "ansi", "vt100"] {
+            if let Some(info) = terminfo_for(term) {
+                assert!(over(&info), "{term}");
+            }
+        }
+        if let Some(vt100) = terminfo_for("vt100") {
+            assert_eq!(
+                OutputStream::detect(ColorMode::Auto, &pty, Some(&vt100)).color,
+                ColorChoice::Never
+            );
+        }
+
+        // A dumb terminal has neither, and a TERM terminfo does not know
+        // describes nothing: a display is not drawn over on a guess.
+        if let Some(dumb) = terminfo_for("dumb") {
+            assert!(!over(&dumb));
+            assert!(!cursor_capable(&dumb));
+        }
+        assert!(!OutputStream::detect(ColorMode::Auto, &pty, None).cursor_capable);
+    }
+
+    #[test]
+    fn test_an_appended_line_does_not_turn_on_hidden_turn_counts() {
+        // Two stages running, and the appending display has said so once.
+        let mut state = progress_state(appending());
+        let mut p = patch_state(PatchStatus::Reviewing);
+        p.active_stages.insert("locking".to_string());
+        p.active_stages.insert("security".to_string());
+        p.active_stage_turns.insert("locking".to_string(), 2);
+        state.patches.insert(1, p.clone());
+
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("append a line");
+        let first = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert!(!first.is_empty(), "said nothing at all");
+
+        // The other stage takes more turns than the first. Nothing the reader can
+        // see has changed: the same two stages are running, and the counter that
+        // moved is not in the line.
+        p.active_stage_turns.insert("security".to_string(), 5);
+        state.patches.insert(1, p);
+
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("append nothing");
+        let second = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert!(
+            second.is_empty(),
+            "said it again over a hidden turn count: {first:?} then {second:?}"
+        );
+    }
+
+    #[test]
+    fn test_status_label_drops_the_turn_counter_when_not_repainting() {
+        let mut p = patch_state(PatchStatus::Reviewing);
+        p.active_stages.insert("locking".to_string());
+        p.active_stage_turns.insert("locking".to_string(), 3);
+
+        assert_eq!(
+            status_label(ProjectId::Linux, &p, true),
+            "Locking & Sync (turn 3)"
+        );
+        assert_eq!(status_label(ProjectId::Linux, &p, false), "Locking & Sync");
+
+        // A repainting frame still leads with the busiest stage, since the counter
+        // it shows says why that one leads. Security overtakes locking here.
+        p.active_stages.insert("security".to_string());
+        p.active_stage_turns.insert("security".to_string(), 9);
+        assert_eq!(
+            status_label(ProjectId::Linux, &p, true),
+            "Security Audit (turn 9) (+1 stages)"
+        );
+
+        // Without the counter the set's own order decides, so the line holds still
+        // while the counters move underneath it.
+        assert_eq!(
+            status_label(ProjectId::Linux, &p, false),
+            "Locking & Sync (+1 stages)"
+        );
+        p.active_stage_turns.insert("locking".to_string(), 40);
+        assert_eq!(
+            status_label(ProjectId::Linux, &p, false),
+            "Locking & Sync (+1 stages)"
+        );
+
+        // It changes when the set changes, which is what the line is for.
+        p.active_stages.remove("locking");
+        assert_eq!(status_label(ProjectId::Linux, &p, false), "Security Audit");
     }
 
     #[test]
