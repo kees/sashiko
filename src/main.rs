@@ -1224,28 +1224,18 @@ struct PatchState {
     active_stage_turns: std::collections::HashMap<String, usize>,
 }
 
-fn get_terminal_width() -> usize {
-    if let Ok(output) = std::process::Command::new("stty").arg("size").output() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let parts: Vec<&str> = stdout.split_whitespace().collect();
-        if let Some(cols) = parts
-            .get(1)
-            .filter(|_| parts.len() == 2)
-            .and_then(|s| s.parse::<usize>().ok())
-        {
-            return cols;
-        }
+/// The window size of the terminal behind `stream`, in rows and columns, or
+/// None where the stream has none.
+///
+/// A stream can be a terminal and still have no size to report: a pty carries a
+/// window size only once something sets one, and answers zeroes until then.
+fn window_size(stream: &impl AsFd) -> Option<(usize, usize)> {
+    let size = rustix::termios::tcgetwinsize(stream).ok()?;
+    if size.ws_row == 0 || size.ws_col == 0 {
+        return None;
     }
 
-    if let Ok(cols) = std::env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .ok_or(())
-    {
-        return cols;
-    }
-
-    80
+    Some((size.ws_row as usize, size.ws_col as usize))
 }
 
 struct ProgressState {
@@ -1346,6 +1336,11 @@ fn cursor_capable(info: &terminfo::Database) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct OutputStream {
     color: ColorChoice,
+    /// Rows and columns, or 24x80 from a stream that reports no window. Being a
+    /// terminal and having a size are separate answers: a pty whose size has
+    /// never been set is a terminal that reports none, and "--color always" asks
+    /// for escapes on streams that are no terminal at all.
+    size: (usize, usize),
     /// Whether the progress display may draw over its own frame here, rather
     /// than appending a line at a time.
     cursor_capable: bool,
@@ -1386,6 +1381,7 @@ impl OutputStream {
         Self {
             color,
             cursor_capable,
+            size: window_size(stream).unwrap_or((24, 80)),
         }
     }
 }
@@ -1655,7 +1651,7 @@ async fn handle_review_command(
         printed_lines: 0,
         total_turns: 0,
         last_status: std::collections::BTreeMap::new(),
-        terminal_width: get_terminal_width(),
+        terminal_width: display.size.1,
         color_choice: display.color,
         cursor_capable: display.cursor_capable,
     }));
@@ -2819,7 +2815,7 @@ mod tests {
             last_status: std::collections::BTreeMap::new(),
             printed_lines: 0,
             total_turns: 0,
-            terminal_width: 100,
+            terminal_width: display.size.1,
             color_choice: display.color,
             cursor_capable: display.cursor_capable,
         }
@@ -2839,19 +2835,47 @@ mod tests {
 
     /// A stream the display may draw over, with no color: what a vt100 answers,
     /// and what keeps a painted frame out of the test output.
-    fn repainting() -> OutputStream {
+    fn repainting(size: (usize, usize)) -> OutputStream {
         OutputStream {
             color: ColorChoice::Never,
             cursor_capable: true,
+            size,
         }
     }
 
     /// A stream the display is told about each change on.
-    fn appending() -> OutputStream {
+    fn appending(size: (usize, usize)) -> OutputStream {
         OutputStream {
             color: ColorChoice::Never,
             cursor_capable: false,
+            size,
         }
+    }
+
+    #[test]
+    fn test_window_size_asks_the_stream_it_is_given() {
+        // Nothing to report from a stream that is no terminal.
+        let redirected = std::fs::File::open("/dev/null").expect("open /dev/null");
+        assert_eq!(window_size(&redirected), None);
+
+        // Nor from a terminal whose size has never been set: a fresh pty master
+        // answers isatty yes and zeroes for its window.
+        let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        assert!(pty.is_terminal());
+        assert_eq!(window_size(&pty), None);
+
+        // Give that pty a size and the ioctl reads it back, rows first.
+        rustix::termios::tcsetwinsize(
+            &pty,
+            rustix::termios::Winsize {
+                ws_row: 42,
+                ws_col: 118,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )
+        .expect("set the pty window size");
+        assert_eq!(window_size(&pty), Some((42, 118)));
     }
 
     #[test]
@@ -2931,7 +2955,7 @@ mod tests {
 
     #[test]
     fn test_a_frame_erases_the_one_before_it() {
-        let mut state = progress_state(repainting());
+        let mut state = progress_state(repainting((24, 100)));
         state.patches.insert(1, patch_state(PatchStatus::Queued));
 
         // One line for the patch and one for the overall bar. The first frame
@@ -2957,7 +2981,7 @@ mod tests {
 
     #[test]
     fn test_a_terminal_that_cannot_be_drawn_over_gets_appended_lines() {
-        let mut state = progress_state(appending());
+        let mut state = progress_state(appending((24, 80)));
         state.patches.insert(1, patch_state(PatchStatus::Queued));
 
         // Nothing is erased and no escape sequence is written, so the output
@@ -3020,7 +3044,7 @@ mod tests {
     #[test]
     fn test_an_appended_line_does_not_turn_on_hidden_turn_counts() {
         // Two stages running, and the appending display has said so once.
-        let mut state = progress_state(appending());
+        let mut state = progress_state(appending((24, 80)));
         let mut p = patch_state(PatchStatus::Reviewing);
         p.active_stages.insert("locking".to_string());
         p.active_stages.insert("security".to_string());
