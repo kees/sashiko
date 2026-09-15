@@ -30,7 +30,7 @@ use std::io::Write;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
+use termcolor::{Buffer, BufferWriter, Color, ColorChoice, ColorSpec, StandardStream, WriteColor};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{error, info, warn};
@@ -1282,16 +1282,17 @@ fn watch_for_resize(
         while resized.recv().await.is_some() {
             // The signal is delivered to the process, not to a stream, so it
             // says only that something was resized. Ask what this stream is now
-            // and let the answer decide: a wake that leaves the width where it
-            // was has nothing to redraw for.
-            let Some((_, cols)) = window_size(&stream) else {
+            // and let the answer decide: a wake that leaves the screen the size
+            // it was has nothing to redraw for.
+            let Some((rows, cols)) = window_size(&stream) else {
                 continue;
             };
 
             let mut state = state.lock().unwrap();
-            if state.terminal_width == cols {
+            if (state.terminal_rows, state.terminal_width) == (rows, cols) {
                 continue;
             }
+            state.terminal_rows = rows;
             state.terminal_width = cols;
             repaint(&mut state);
         }
@@ -1304,12 +1305,19 @@ struct ProgressState {
     /// The status each patch was last reported with, so the appending display
     /// speaks only when one of them changes.
     last_status: std::collections::BTreeMap<i64, String>,
-    printed_lines: usize,
     total_turns: usize,
     terminal_width: usize,
+    terminal_rows: usize,
     color_choice: ColorChoice,
-    /// Whether the frame may be drawn over, or has to be appended to.
-    cursor_capable: bool,
+    /// Whether the display may keep lines of its own, or has to append them.
+    reservation_capable: bool,
+    /// Lines currently held at the foot of the screen, zero before the region is
+    /// set up and after it is given back.
+    reserved: usize,
+    /// The screen height those lines were placed against. A resize moves the foot
+    /// of the screen, so the region has to be set again even where the count of
+    /// lines has not changed.
+    region_rows: usize,
 }
 
 /// Display label for a stage. Held in the stage tables so that adding a stage
@@ -1381,14 +1389,19 @@ fn color_capable(info: &terminfo::Database) -> bool {
         && info.get::<terminfo::capability::SetAForeground>().is_some()
 }
 
-/// Whether the terminal `info` describes can be drawn over: cursor_up to walk
-/// back over the last frame, and clr_eol to take each line of it away.
+/// Whether the terminal `info` describes can keep lines to itself:
+/// change_scroll_region to confine scrolling to everything above them,
+/// save_cursor and restore_cursor to leave ordinary output where it was, and
+/// cursor_address to write the lines outright.
 ///
-/// A separate question from color, with a separate answer: a vt100 has every
-/// cursor capability and no color at all, while a dumb terminal has neither.
-fn cursor_capable(info: &terminfo::Database) -> bool {
-    info.get::<terminfo::capability::CursorUp>().is_some()
-        && info.get::<terminfo::capability::ClrEol>().is_some()
+/// Independent of whether it has color: a vt100 can do all of this and has no
+/// color at all, while TERM=ansi has color and no scroll region.
+fn reservation_capable(info: &terminfo::Database) -> bool {
+    info.get::<terminfo::capability::ChangeScrollRegion>()
+        .is_some()
+        && info.get::<terminfo::capability::SaveCursor>().is_some()
+        && info.get::<terminfo::capability::RestoreCursor>().is_some()
+        && info.get::<terminfo::capability::CursorAddress>().is_some()
 }
 
 /// What one of the streams a review writes to can do. Asked of the stream
@@ -1401,9 +1414,9 @@ struct OutputStream {
     /// never been set is a terminal that reports none, and "--color always" asks
     /// for escapes on streams that are no terminal at all.
     size: (usize, usize),
-    /// Whether the progress display may draw over its own frame here, rather
-    /// than appending a line at a time.
-    cursor_capable: bool,
+    /// Whether the progress display may keep lines of its own here, rather than
+    /// appending a line at a time.
+    reservation_capable: bool,
 }
 
 impl OutputStream {
@@ -1418,14 +1431,23 @@ impl OutputStream {
             None => std::env::var("TERM").is_ok_and(|term| !term.is_empty() && term != "dumb"),
         };
 
+        // Lines at the foot of the screen can only be placed on a screen whose
+        // height is known. A stream that reports no window gets none, whatever
+        // the terminal is otherwise capable of, rather than having them placed
+        // against the fallback and written over what is on screen.
+        let size = window_size(stream);
+        let can_reserve = |info: &terminfo::Database| size.is_some() && reservation_capable(info);
+
         // "always" and "never" answer for the run rather than for a stream, so
         // only "auto" asks the stream or the terminal anything. A stream that is
         // no terminal has no terminal behind it to ask, so it gets no color
         // whatever TERM says.
-        let (color, cursor_capable) = match mode {
+        let (color, reservation_capable) = match mode {
             // Forcing color asserts that the escapes arrive whatever isatty
-            // says, cursor movement among them.
-            ColorMode::Always => (ColorChoice::Always, true),
+            // says. It asserts nothing about scroll regions, so a terminal
+            // terminfo does not know is told about each change rather than
+            // trusted with part of the screen.
+            ColorMode::Always => (ColorChoice::Always, terminal.is_some_and(can_reserve)),
             ColorMode::Never => (ColorChoice::Never, false),
             ColorMode::Auto if stream.as_fd().is_terminal() => (
                 if colored {
@@ -1433,24 +1455,103 @@ impl OutputStream {
                 } else {
                     ColorChoice::Never
                 },
-                terminal.is_some_and(cursor_capable),
+                terminal.is_some_and(can_reserve),
             ),
             ColorMode::Auto => (ColorChoice::Never, false),
         };
 
         Self {
             color,
-            cursor_capable,
-            size: window_size(stream).unwrap_or((24, 80)),
+            reservation_capable,
+            size: size.unwrap_or((24, 80)),
         }
     }
 }
 
 /// Paints a frame to stderr, where the progress display lives, in one write.
 fn render_progress(state: &mut ProgressState) {
+    on_stderr(state, paint_progress);
+}
+
+/// Gives back whatever the display took of the screen, to stderr.
+///
+/// Called before the report prints rather than left to a destructor: the review
+/// exits through std::process::exit when it has findings, and destructors do not
+/// run then.
+fn finish_progress(state: &mut ProgressState) {
+    on_stderr(state, release_progress_region);
+}
+
+/// Gives the screen back on the way out of a panic, before the panic itself is
+/// reported.
+///
+/// A scroll region is the one thing this display leaves behind that outlives the
+/// process, and a panic reaches neither the release below nor a destructor on the
+/// way past. The hook writes the reset itself rather than going through the
+/// display's state: a panic while that mutex is held would otherwise wait for a
+/// lock nothing is going to give back. It saves and restores the cursor around
+/// the reset, DECSTBM homing it, or the panic prints from the top of the screen
+/// over whatever was there.
+fn release_region_on_panic() {
+    let reported = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic| {
+        // Scrolling back to the whole screen, leaving the cursor where the
+        // output had reached, and a line to report from.
+        let _ = std::io::stderr().write_all(b"\x1b7\x1b[r\x1b8\n");
+        reported(panic);
+    }));
+}
+
+/// Gives the screen back when the review is interrupted.
+///
+/// Ctrl-C kills the process where it stands, reaching neither the release above
+/// nor the panic hook, and the scroll region outlives it: the shell that comes
+/// back is confined to the top of the screen until something resets it. So the
+/// signals that end a review are taken, the reset written, and the process left
+/// to exit with the status that signal would have given it.
+///
+/// Saves and restores the cursor around the reset, as the panic hook does, or a
+/// review interrupted mid-frame reports from the top of the screen.
+///
+/// Taking them replaces the default action, so the exit status is put back by
+/// hand: the shell that started the review still sees it die of the signal it
+/// sent. The reset is four bytes and the exit follows it, so the window where a
+/// second interrupt would find nothing listening is not one worth covering.
+fn release_region_on_interrupt() {
+    for kind in [
+        SignalKind::interrupt(),
+        SignalKind::terminate(),
+        SignalKind::hangup(),
+    ] {
+        let Ok(mut signalled) = signal(kind) else {
+            warn!("Progress display cannot give the screen back if interrupted");
+            continue;
+        };
+
+        tokio::spawn(async move {
+            if signalled.recv().await.is_some() {
+                // Scrolling back to the whole screen, leaving the cursor where
+                // the output had reached, and a line to report from.
+                let _ = std::io::stderr().write_all(b"\x1b7\x1b[r\x1b8\n");
+                std::process::exit(128 + kind.as_raw_value());
+            }
+        });
+    }
+}
+
+/// Writes what `paint` produces to stderr, in one write.
+///
+/// The one place that knows the display draws on stderr. A whole frame in a
+/// single write also arrives whole: every write to stderr takes the same lock
+/// inside std, so nothing of the log can land between the cursor being saved and
+/// restored and be written into the reserved lines.
+fn on_stderr(
+    state: &mut ProgressState,
+    paint: impl FnOnce(&mut ProgressState, &mut Buffer) -> std::io::Result<()>,
+) {
     let stderr = BufferWriter::stderr(state.color_choice);
     let mut frame = stderr.buffer();
-    if paint_progress(state, &mut frame).is_ok() {
+    if paint(state, &mut frame).is_ok() {
         let _ = stderr.print(&frame);
     }
 }
@@ -1526,26 +1627,151 @@ fn paint_progress_plain(
     out.flush()
 }
 
+/// Whether `wanted` lines are worth taking out of a screen of `rows`.
+///
+/// The display is there to be glanced at while a review's own output scrolls
+/// past it, so it may have at most three quarters of the screen. Thirty patches
+/// on a twenty-four line terminal would otherwise leave nothing to scroll in,
+/// and the reader watching a display instead of a review.
+fn worth_reserving(wanted: usize, rows: usize) -> bool {
+    wanted * 4 <= rows * 3
+}
+
+/// Reserves `wanted` lines at the foot of the screen for the display.
+///
+/// Scrolls up to make room, then confines scrolling to everything above the lines
+/// it took with DECSTBM, so ordinary output can never reach them.
+///
+/// The room is scrolled for at the foot of the screen, which is the only place a
+/// newline is certain to scroll rather than to step onto a line that is already
+/// free. The output then carries on from the line it had reached, which that
+/// scrolling moved up by as many lines as were taken: saved beforehand, restored
+/// after, and walked up by that many.
+///
+/// Walking it up is what keeps it inside the new region. A line at the foot of an
+/// old one would otherwise be left below the new bottom margin, where output
+/// neither scrolls nor moves on, and the log would sit there overwriting the
+/// first line of the frame.
+///
+/// DECSTBM homes the cursor, and so does the form that gives the margins back,
+/// so every one of them here sits between a save and a restore. Without that the
+/// room is made from the top of the screen rather than from the line the output
+/// reached, which scrolls nothing and leaves nothing free, and the log carries on
+/// at the top of the screen over what is already there.
+///
+/// Asked for only where those lines are worth taking, so the caller has already
+/// left something to scroll in.
+fn reserve_progress_region(
+    state: &mut ProgressState,
+    out: &mut impl WriteColor,
+    wanted: usize,
+) -> std::io::Result<()> {
+    let room = wanted.saturating_sub(state.reserved);
+    if room > 0 {
+        // Where the output has reached, to come back to.
+        write!(out, "\x1b7")?;
+
+        // The whole screen, so the newlines scroll all of it rather than the
+        // part above a region already held.
+        if state.reserved > 0 {
+            write!(out, "\x1b[r")?;
+        }
+
+        // At the foot of the screen a newline can only scroll, which is the
+        // point: every line taken has to come from somewhere.
+        write!(out, "\x1b[{};1H", state.terminal_rows)?;
+        for _ in 0..room {
+            writeln!(out)?;
+        }
+
+        // Back to the output's line, which that scrolling moved up by as many
+        // lines as were taken, and which is therefore inside the new region.
+        write!(out, "\x1b8\x1b[{room}A")?;
+    }
+
+    let split = state.terminal_rows - wanted;
+    write!(out, "\x1b7\x1b[1;{split}r\x1b8")?;
+
+    state.reserved = wanted;
+    state.region_rows = state.terminal_rows;
+    Ok(())
+}
+
+/// Gives the screen back: the lines the display held are cleared and scrolling
+/// returns to the whole screen, with the cursor left where the output had reached.
+///
+/// Whatever prints next carries on from there, rather than from below lines that
+/// are no longer the display's, so a review that filled a screen and one that
+/// printed six lines both continue where they left off. DECSTBM homes the cursor,
+/// which is why all of this sits between a save and a restore.
+///
+/// Says so whether or not lines are currently held. A region left set is the one
+/// piece of this display that outlives the process, and a resize can leave the
+/// count of held lines behind.
+fn release_progress_region(
+    state: &mut ProgressState,
+    out: &mut impl WriteColor,
+) -> std::io::Result<()> {
+    if !state.reservation_capable {
+        return Ok(());
+    }
+
+    // Only the lines this display holds are cleared, and only while it still
+    // knows which rows those are. A screen resized since the region was placed
+    // does not: clearing the last `reserved` rows of a screen that has shrunk
+    // below that count would clear all of it, rows that were never the
+    // display's. The margins still go back, and the stale frame scrolls away.
+    let held = if state.region_rows == state.terminal_rows {
+        state.reserved
+    } else {
+        0
+    };
+
+    write!(out, "\x1b7")?;
+    let top = state.terminal_rows.saturating_sub(held) + 1;
+    for row in top..=state.terminal_rows {
+        write!(out, "\x1b[{row};1H\x1b[2K")?;
+    }
+    write!(out, "\x1b[r\x1b8")?;
+
+    state.reserved = 0;
+    out.flush()
+}
+
 /// Paints one frame into `out`, erasing the frame before it.
 ///
 /// Every byte the display produces goes here, stderr included, so what a frame
 /// is can be asked of a buffer rather than of a terminal. Nothing in this
 /// function knows which stream it draws on.
 fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::io::Result<()> {
-    // Walking back over the last frame needs a terminal that can be walked back
-    // over. Where it cannot, the display says its piece a line at a time.
-    if !state.cursor_capable {
+    // One line per patch and one for the overall bar. Reserving happens once, and
+    // again when that count changes, which it does as the patches become known.
+    let wanted = state.patches.len() + 1;
+    if !state.reservation_capable || !worth_reserving(wanted, state.terminal_rows) {
+        // A display that has outgrown the screen was holding a region until now,
+        // and hands it back on the way to saying its piece a line at a time.
+        if state.reserved > 0 {
+            release_progress_region(state, out)?;
+        }
         return paint_progress_plain(state, out);
     }
 
-    for _ in 0..state.printed_lines {
-        write!(out, "\x1b[F\x1b[2K")?;
+    // A resize moves the foot of the screen, so the region is set again for the
+    // new height as well as for a new count of lines.
+    if wanted != state.reserved || state.terminal_rows != state.region_rows {
+        reserve_progress_region(state, out, wanted)?;
     }
+    // Save the cursor before addressing those lines and put it back after:
+    // ordinary output carries on above, where it left off.
+    write!(out, "\x1b7")?;
 
     let mut lines_printed = 0;
     let limit = state.terminal_width.saturating_sub(5);
 
+    let top = state.terminal_rows.saturating_sub(state.reserved) + 1;
+
     for (&idx, p) in &state.patches {
+        write!(out, "\x1b[{};1H\x1b[2K", top + lines_printed)?;
         let status_str = status_label(state.project, p, true);
 
         // Calculate available width for subject to guarantee status is never truncated
@@ -1587,7 +1813,6 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         };
         let _ = tw.write_segment(out, &status_str, status_color, status_bold);
 
-        writeln!(out)?;
         lines_printed += 1;
     }
 
@@ -1612,6 +1837,7 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         let (display_completed_stages, percent, filled) =
             calculate_progress_metrics(total_stages, completed_stages, width);
 
+        write!(out, "\x1b[{};1H\x1b[2K", top + lines_printed)?;
         let mut tw = TruncatingWriter::new(limit);
         let _ = tw.write_segment(out, "Overall: [", None, true);
 
@@ -1628,12 +1854,9 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
             percent, display_completed_stages, total_stages, state.total_turns
         );
         let _ = tw.write_segment(out, &stats, None, false);
-
-        writeln!(out)?;
-        lines_printed += 1;
     }
 
-    state.printed_lines = lines_printed;
+    write!(out, "\x1b8")?;
     out.flush()
 }
 
@@ -1708,12 +1931,14 @@ async fn handle_review_command(
     let progress_state = std::sync::Arc::new(std::sync::Mutex::new(ProgressState {
         project,
         patches: std::collections::BTreeMap::new(),
-        printed_lines: 0,
         total_turns: 0,
         last_status: std::collections::BTreeMap::new(),
         terminal_width: display.size.1,
+        terminal_rows: display.size.0,
         color_choice: display.color,
-        cursor_capable: display.cursor_capable,
+        reservation_capable: display.reservation_capable,
+        reserved: 0,
+        region_rows: 0,
     }));
 
     let progress_state_clone = progress_state.clone();
@@ -1837,9 +2062,14 @@ async fn handle_review_command(
         }
     };
 
-    // Only a display that draws again has a width to be wrong about: appended
+    if display.reservation_capable {
+        release_region_on_panic();
+        release_region_on_interrupt();
+    }
+
+    // Only a display that draws again has a size to be wrong about: appended
     // lines are never drawn twice.
-    let resize = if display.cursor_capable {
+    let resize = if display.reservation_capable {
         watch_for_resize(progress_state.clone(), std::io::stderr(), render_progress)
     } else {
         None
@@ -1860,11 +2090,22 @@ async fn handle_review_command(
         },
         Some(&progress),
     )
-    .await?;
+    .await;
 
     if let Some(resize) = resize {
+        // Asked to stop, and waited for. A repaint already past its await and
+        // waiting on the display's lock has nowhere to be cancelled, so without
+        // the wait it can take the screen again after it has been given back, and
+        // leave the terminal scrolling inside a region nothing owns.
         resize.abort();
+        let _ = resize.await;
     }
+
+    // Before anything else prints, and before a failed review carries its error
+    // out of here: the report is ordinary output, and the screen has to be whole
+    // again for it either way.
+    finish_progress(&mut progress_state.lock().unwrap());
+    let result = result?;
 
     match format {
         OutputFormat::Json => {
@@ -2885,11 +3126,13 @@ mod tests {
             project: ProjectId::Linux,
             patches: std::collections::BTreeMap::new(),
             last_status: std::collections::BTreeMap::new(),
-            printed_lines: 0,
             total_turns: 0,
             terminal_width: display.size.1,
+            terminal_rows: display.size.0,
             color_choice: display.color,
-            cursor_capable: display.cursor_capable,
+            reservation_capable: display.reservation_capable,
+            reserved: 0,
+            region_rows: 0,
         }
     }
 
@@ -2905,12 +3148,12 @@ mod tests {
         }
     }
 
-    /// A stream the display may draw over, with no color: what a vt100 answers,
-    /// and what keeps a painted frame out of the test output.
-    fn repainting(size: (usize, usize)) -> OutputStream {
+    /// A stream the display may keep lines of its own on, with no color: what a
+    /// vt100 answers, and what keeps a painted frame out of the test output.
+    fn reserving(size: (usize, usize)) -> OutputStream {
         OutputStream {
             color: ColorChoice::Never,
-            cursor_capable: true,
+            reservation_capable: true,
             size,
         }
     }
@@ -2919,7 +3162,7 @@ mod tests {
     fn appending(size: (usize, usize)) -> OutputStream {
         OutputStream {
             color: ColorChoice::Never,
-            cursor_capable: false,
+            reservation_capable: false,
             size,
         }
     }
@@ -2944,7 +3187,7 @@ mod tests {
         let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
         resize(&pty, 24, 80);
 
-        let state = Arc::new(std::sync::Mutex::new(progress_state(repainting((24, 80)))));
+        let state = Arc::new(std::sync::Mutex::new(progress_state(reserving((24, 80)))));
 
         // Counted rather than painted: a frame painted here would be written to
         // the terminal running the test, and escape sequences left there outlive
@@ -3001,7 +3244,7 @@ mod tests {
         // before anything is listening for the signal that says so.
         let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
         resize(&pty, 24, 80);
-        let state = Arc::new(std::sync::Mutex::new(progress_state(repainting((24, 80)))));
+        let state = Arc::new(std::sync::Mutex::new(progress_state(reserving((24, 80)))));
         resize(&pty, 24, 132);
 
         // No signal is raised here: that one is gone. Registering asks for the
@@ -3027,7 +3270,7 @@ mod tests {
     async fn test_a_stream_with_no_window_is_not_followed() {
         // Nothing to follow: no size to ask for, and no terminal to resize.
         let redirected = std::fs::File::open("/dev/null").expect("open /dev/null");
-        let state = Arc::new(std::sync::Mutex::new(progress_state(repainting((24, 80)))));
+        let state = Arc::new(std::sync::Mutex::new(progress_state(reserving((24, 80)))));
 
         assert!(watch_for_resize(state, redirected, render_progress).is_none());
     }
@@ -3134,45 +3377,257 @@ mod tests {
     }
 
     #[test]
-    fn test_a_frame_erases_the_one_before_it() {
-        let mut state = progress_state(repainting((24, 100)));
+    fn test_a_reserved_frame_addresses_its_own_lines() {
+        let mut state = progress_state(reserving((24, 100)));
         state.patches.insert(1, patch_state(PatchStatus::Queued));
 
-        // One line for the patch and one for the overall bar. The first frame
-        // erases nothing, there being nothing on screen yet.
+        // Two lines wanted, so scrolling is confined to the 22 above them and
+        // the frame is written at rows 23 and 24. Nothing is erased by walking
+        // the cursor: each line is addressed and cleared where it stands.
         let mut frame = Buffer::no_color();
         paint_progress(&mut state, &mut frame).expect("paint a frame");
         let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
-        assert!(!painted.contains("\x1b[F"), "erased something: {painted:?}");
-        assert!(painted.contains("[Patch 1] a patch"));
-        assert!(painted.contains("Overall: ["));
-        assert_eq!(state.printed_lines, 2);
+        assert_eq!(state.reserved, 2);
+        assert!(
+            painted.contains("\x1b[1;22r"),
+            "no scroll region: {painted:?}"
+        );
+        assert!(painted.contains("\x1b[23;1H\x1b[2K"), "{painted:?}");
+        assert!(painted.contains("\x1b[24;1H\x1b[2K"), "{painted:?}");
+        assert!(
+            !painted.contains("\x1b[F"),
+            "walked the cursor: {painted:?}"
+        );
 
-        // The next one walks back over both of those lines and clears each.
+        // The cursor is put back where the log left it, so ordinary output
+        // carries on above.
+        assert!(painted.contains("\x1b7"), "{painted:?}");
+        assert!(painted.ends_with("\x1b8"), "{painted:?}");
+
+        // Reserving happens once. A second frame addresses the same lines and
+        // sets no region again.
         let mut frame = Buffer::no_color();
         paint_progress(&mut state, &mut frame).expect("paint a frame");
         let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
         assert!(
-            painted.starts_with("\x1b[F\x1b[2K\x1b[F\x1b[2K"),
-            "{painted:?}"
+            !painted.contains("\x1b[1;22r"),
+            "reserved twice: {painted:?}"
         );
-        assert_eq!(state.printed_lines, 2);
+        assert!(painted.contains("\x1b[23;1H\x1b[2K"), "{painted:?}");
+
+        // A patch more is a line more, so the region is set again.
+        state.patches.insert(2, patch_state(PatchStatus::Reviewing));
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("paint a frame");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert_eq!(state.reserved, 3);
+        assert!(painted.contains("\x1b[1;21r"), "{painted:?}");
     }
 
     #[test]
-    fn test_a_terminal_that_cannot_be_drawn_over_gets_appended_lines() {
+    fn test_room_is_scrolled_for_at_the_foot_of_the_screen() {
+        let mut state = progress_state(reserving((24, 100)));
+        state.patches.insert(1, patch_state(PatchStatus::Queued));
+
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("paint a frame");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+
+        // Two lines of room, made with newlines from wherever the output had
+        // reached: on a full screen those scroll, and on one with space below
+        // they cost nothing. The cursor then goes back up the same two lines, so
+        // the output carries on where it was rather than at a row counted from
+        // the top of the screen, and nothing on screen is written over.
+        // Two lines scrolled for at row 24, the foot of the screen, where a
+        // newline can only scroll. The output's line is saved beforehand and
+        // restored after, then walked up the two lines the scrolling moved it.
+        // Nothing hands back a region the first time, there being none yet.
+        let frame = painted.rfind("\x1b7").expect("a frame follows");
+        let reserving = &painted[..frame];
+        assert_eq!(
+            reserving,
+            "\x1b7\x1b[24;1H\n\n\x1b8\x1b[2A\x1b7\x1b[1;22r\x1b8"
+        );
+
+        // A patch more wants a line more. The region held is handed back first, so
+        // the newline scrolls the whole screen rather than the part above it.
+        state.patches.insert(2, patch_state(PatchStatus::Reviewing));
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("paint a frame");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        let reserving = &painted[..painted.rfind("\x1b7").expect("a frame follows")];
+        assert_eq!(
+            reserving,
+            "\x1b7\x1b[r\x1b[24;1H\n\x1b8\x1b[1A\x1b7\x1b[1;21r\x1b8"
+        );
+
+        // That last move up is what keeps the output inside the region it just
+        // made: a line at the foot of the old one would otherwise be left below
+        // the new bottom margin, on the frame's first line.
+        assert!(reserving.ends_with("\x1b[1;21r\x1b8"), "{reserving:?}");
+    }
+
+    #[test]
+    fn test_a_screen_that_has_shrunk_is_not_cleared_whole() {
+        let mut state = progress_state(reserving((24, 100)));
+        state.patches.insert(1, patch_state(PatchStatus::Queued));
+        paint_progress(&mut state, &mut Buffer::no_color()).expect("paint a frame");
+        assert_eq!((state.reserved, state.region_rows), (2, 24));
+
+        // The screen is now shorter than the display was holding. Clearing the
+        // last two rows of it would clear rows that were never the display's, and
+        // where it has shrunk below the count held, all of them. It knows where
+        // those lines were only while the screen is the height they were placed
+        // against, so here it clears nothing and hands the margins back.
+        state.terminal_rows = 2;
+        let mut end = Buffer::no_color();
+        release_progress_region(&mut state, &mut end).expect("give the screen back");
+        let written = String::from_utf8(end.into_inner()).expect("utf-8");
+        assert_eq!(written, "\x1b7\x1b[r\x1b8");
+        assert_eq!(state.reserved, 0);
+    }
+
+    #[test]
+    fn test_a_resize_moves_the_region_with_the_foot_of_the_screen() {
+        let mut state = progress_state(reserving((24, 100)));
+        state.patches.insert(1, patch_state(PatchStatus::Queued));
+        paint_progress(&mut state, &mut Buffer::no_color()).expect("paint a frame");
+        assert_eq!((state.reserved, state.region_rows), (2, 24));
+
+        // The same two lines, and nothing to do about them.
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("paint a frame");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert!(!painted.contains("\x1b[1;"), "reserved again: {painted:?}");
+
+        // A shorter screen puts them somewhere else, so the region is placed
+        // again even though it is still two lines.
+        state.terminal_rows = 12;
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("paint a frame");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert_eq!((state.reserved, state.region_rows), (2, 12));
+        assert!(painted.contains("\x1b[1;10r"), "{painted:?}");
+        assert!(painted.contains("\x1b[11;1H\x1b[2K"), "{painted:?}");
+    }
+
+    #[test]
+    fn test_the_screen_is_given_back_whole() {
+        let mut state = progress_state(reserving((24, 100)));
+        state.patches.insert(1, patch_state(PatchStatus::Queued));
+        paint_progress(&mut state, &mut Buffer::no_color()).expect("paint a frame");
+        assert_eq!(state.reserved, 2);
+
+        // A region left set is what outlives the process, so it is given back
+        // whatever the display thinks it is holding.
+        let mut end = Buffer::no_color();
+        release_progress_region(&mut state, &mut end).expect("give the screen back");
+        let written = String::from_utf8(end.into_inner()).expect("utf-8");
+        assert_eq!(state.reserved, 0);
+
+        // The two lines it held are cleared, scrolling goes back to the whole
+        // screen, and the cursor is left where the output had reached: whatever
+        // prints next carries on from there rather than from below the frame.
+        assert_eq!(
+            written,
+            "\x1b7\x1b[23;1H\x1b[2K\x1b[24;1H\x1b[2K\x1b[r\x1b8"
+        );
+
+        // Said again with nothing held, since a region left set outlives the
+        // process and a resize can leave the count behind.
+        let mut end = Buffer::no_color();
+        release_progress_region(&mut state, &mut end).expect("say so again");
+        assert_eq!(
+            String::from_utf8(end.into_inner()).expect("utf-8"),
+            "\x1b7\x1b[r\x1b8"
+        );
+
+        // A display that never took a region has none to give back.
+        let mut state = progress_state(appending((24, 100)));
+        let mut end = Buffer::no_color();
+        release_progress_region(&mut state, &mut end).expect("nothing to do");
+        assert!(end.into_inner().is_empty());
+    }
+
+    #[test]
+    fn test_a_display_that_wants_most_of_the_screen_does_not_get_it() {
+        // Three quarters is the most it may have, so eighteen lines of twenty
+        // four: seventeen patches and the overall bar.
+        assert!(worth_reserving(18, 24));
+        assert!(!worth_reserving(19, 24));
+        assert!(worth_reserving(3, 4));
+        assert!(!worth_reserving(4, 4));
+
+        let mut state = progress_state(reserving((24, 100)));
+        for idx in 1..=17 {
+            state.patches.insert(idx, patch_state(PatchStatus::Queued));
+        }
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("paint a frame");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert_eq!(state.reserved, 18);
+        assert!(painted.contains("\x1b[1;6r"), "{painted:?}");
+
+        // One patch more and the display is not worth the screen. The region
+        // goes back as it changes over, so what scrolled only inside it scrolls
+        // everywhere again, and each change is appended from there on.
+        state.patches.insert(18, patch_state(PatchStatus::Queued));
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("append instead");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert_eq!(state.reserved, 0);
+
+        // The lines it held are cleared and the region handed back, and what it
+        // says from there on is text: nothing addresses a row again.
+        let (given_back, appended) = painted
+            .split_once("\x1b[r\x1b8")
+            .expect("the region goes back");
+        assert!(given_back.contains("\x1b[2K"), "{given_back:?}");
+        assert!(
+            !appended.contains('\x1b'),
+            "still addressing lines: {appended:?}"
+        );
+        assert!(
+            appended.contains("[Patch 18] a patch | Queued\n"),
+            "{appended:?}"
+        );
+
+        // And once it has changed over, it says so once: the reset is not
+        // repeated with every line it appends afterwards.
+        state.patches.insert(19, patch_state(PatchStatus::Queued));
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("append instead");
+        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
+        assert!(!painted.contains("\x1b"), "said it again: {painted:?}");
+        assert!(painted.contains("[Patch 19] a patch | Queued\n"));
+
+        // A screen too small for any of it never takes a region to begin with.
+        let mut state = progress_state(reserving((4, 100)));
+        for idx in 1..=3 {
+            state.patches.insert(idx, patch_state(PatchStatus::Queued));
+        }
+        let mut frame = Buffer::no_color();
+        paint_progress(&mut state, &mut frame).expect("append instead");
+        assert_eq!(state.reserved, 0);
+        assert!(
+            String::from_utf8(frame.into_inner())
+                .expect("utf-8")
+                .contains("[Patch 1] a patch | Queued")
+        );
+    }
+
+    #[test]
+    fn test_a_terminal_with_no_scroll_region_gets_appended_lines() {
         let mut state = progress_state(appending((24, 80)));
         state.patches.insert(1, patch_state(PatchStatus::Queued));
 
         // Nothing is erased and no escape sequence is written, so the output
-        // survives a terminal that cannot move its cursor and a file that has no
-        // terminal at all. printed_lines stays zero: left set, a later frame
-        // would walk the cursor up through whatever the log wrote in between.
+        // survives a terminal that can keep the display no lines of its own, and
+        // a file with no terminal behind it at all.
         let mut frame = Buffer::no_color();
         paint_progress(&mut state, &mut frame).expect("append a line");
         let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
         assert_eq!(painted, "      [Patch 1] a patch | Queued\n");
-        assert_eq!(state.printed_lines, 0);
         assert_eq!(
             state.last_status.get(&1).map(String::as_str),
             Some("Queued")
@@ -3192,19 +3647,37 @@ mod tests {
     }
 
     #[test]
-    fn test_drawing_over_the_frame_is_the_terminals_answer_too() {
+    fn test_how_the_display_draws_is_the_terminals_answer_too() {
         let pty = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
-        let over = |info: &terminfo::Database| {
-            OutputStream::detect(ColorMode::Auto, &pty, Some(info)).cursor_capable
+        resize(&pty, 24, 80);
+        let keeps_lines = |info: &terminfo::Database| {
+            OutputStream::detect(ColorMode::Auto, &pty, Some(info)).reservation_capable
         };
 
-        // A vt100 can be drawn over and has no color, so it is repainted without
-        // any: the two answers are separate, and neither is read off the other.
-        for term in ["xterm", "linux", "screen", "ansi", "vt100"] {
+        // Terminals that can keep the display lines of their own, for those of
+        // them this machine has an entry for.
+        for term in ["xterm", "linux", "screen", "vt100"] {
             if let Some(info) = terminfo_for(term) {
-                assert!(over(&info), "{term}");
+                assert!(keeps_lines(&info), "{term}");
             }
         }
+
+        // TERM=ansi can be drawn over and has no scroll region, which is the
+        // majority answer across the installed database: it is told about each
+        // change instead, as a dumb terminal is.
+        for term in ["ansi", "dumb"] {
+            if let Some(info) = terminfo_for(term) {
+                assert!(!keeps_lines(&info), "{term}");
+                assert!(!reservation_capable(&info), "{term}");
+            }
+        }
+
+        // As is a TERM terminfo does not know: a screen is not carved up on a
+        // guess.
+        assert!(!OutputStream::detect(ColorMode::Auto, &pty, None).reservation_capable);
+
+        // A vt100 keeps its lines and still has no color: the two answers are
+        // separate, and neither is read off the other.
         if let Some(vt100) = terminfo_for("vt100") {
             assert_eq!(
                 OutputStream::detect(ColorMode::Auto, &pty, Some(&vt100)).color,
@@ -3212,13 +3685,18 @@ mod tests {
             );
         }
 
-        // A dumb terminal has neither, and a TERM terminfo does not know
-        // describes nothing: a display is not drawn over on a guess.
-        if let Some(dumb) = terminfo_for("dumb") {
-            assert!(!over(&dumb));
-            assert!(!cursor_capable(&dumb));
+        // Nor does a capable terminal keep lines where it reports no window: the
+        // foot of the screen is not known, and lines placed against the 24x80
+        // fallback would land in the middle of a taller one, over whatever was
+        // there. A fresh pty master is exactly that terminal.
+        let sizeless = std::fs::File::open("/dev/ptmx").expect("open /dev/ptmx");
+        assert_eq!(window_size(&sizeless), None);
+        if let Some(xterm) = terminfo_for("xterm") {
+            let display = OutputStream::detect(ColorMode::Auto, &sizeless, Some(&xterm));
+            assert!(!display.reservation_capable);
+            assert_eq!(display.size, (24, 80));
+            assert_eq!(display.color, ColorChoice::Auto);
         }
-        assert!(!OutputStream::detect(ColorMode::Auto, &pty, None).cursor_capable);
     }
 
     #[test]
