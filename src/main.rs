@@ -1340,6 +1340,12 @@ struct ProgressState {
     /// of the screen, so the region has to be set again even where the count of
     /// lines has not changed.
     region_rows: usize,
+    /// Whether the display has said its last word.
+    ///
+    /// The review's report prints after this, and the resize watcher outlives the
+    /// region by a moment: a repaint arriving in that moment would take a region
+    /// back and draw a frame across the report. Nothing paints once this is set.
+    finished: bool,
 }
 
 /// Display label for a stage. Held in the stage tables so that adding a stage
@@ -1501,7 +1507,9 @@ fn render_progress(state: &mut ProgressState) {
 /// exits through std::process::exit when it has findings, and destructors do not
 /// run then.
 fn finish_progress(state: &mut ProgressState) {
-    on_stderr(state, release_progress_region);
+    on_stderr(state, |state, out| {
+        release_progress_region(state, out, RegionExit::Kept)
+    });
 }
 
 /// Gives the screen back on the way out of a panic, before the panic itself is
@@ -1705,23 +1713,61 @@ fn reserve_progress_region(
     Ok(())
 }
 
-/// Gives the screen back: the lines the display held are cleared and scrolling
-/// returns to the whole screen, with the cursor left where the output had reached.
+/// What the display leaves on screen when it gives its region back.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RegionExit {
+    /// Erase the frame. The display has outgrown the screen and carries on a
+    /// line at a time from here, so the frame it drew is not its last word.
+    Erased,
+    /// Keep the frame and step past it. The review is over and that frame is
+    /// what it ended up saying, so whatever prints next belongs below it.
+    Kept,
+}
+
+/// Gives the screen back: scrolling returns to the whole screen, and `exit` says
+/// what becomes of the frame the display drew in it.
 ///
-/// Whatever prints next carries on from there, rather than from below lines that
-/// are no longer the display's, so a review that filled a screen and one that
-/// printed six lines both continue where they left off. DECSTBM homes the cursor,
-/// which is why all of this sits between a save and a restore.
+/// An `Erased` release clears the lines it held and leaves the cursor where the
+/// output had reached, so whatever prints next carries on from there rather than
+/// from below lines that are no longer the display's. It says so whether or not
+/// lines are currently held: a region left set is the one piece of this display
+/// that outlives the process, and a resize can leave the count of held lines
+/// behind.
 ///
-/// Says so whether or not lines are currently held. A region left set is the one
-/// piece of this display that outlives the process, and a resize can leave the
-/// count of held lines behind.
+/// A `Kept` release leaves the frame where it is and steps below it instead, and
+/// is the one that says nothing at all where nothing is held, because the escape
+/// that hands the margins back homes the cursor.
 fn release_progress_region(
     state: &mut ProgressState,
     out: &mut impl WriteColor,
+    exit: RegionExit,
 ) -> std::io::Result<()> {
     if !state.reservation_capable {
         return Ok(());
+    }
+
+    if exit == RegionExit::Kept {
+        // Nothing held, nothing said. Giving margins back that were already given
+        // back is not free: DECSTBM homes the cursor, so a reset with no region
+        // behind it sends the report to the top of the screen and over the log
+        // that is already there. This is called twice by design — once when the
+        // review says it is complete, once on the way out for the paths that
+        // never get there — and the second call is exactly that case.
+        if state.reserved == 0 {
+            state.finished = true;
+            return Ok(());
+        }
+
+        // Margins back first, which homes the cursor, then down to the last line
+        // the display held — the overall bar — and one line past it. No save and
+        // no restore: a restore here would put the cursor back inside the rows
+        // the frame occupies, which is what printed the report over them.
+        write!(out, "\x1b[r")?;
+        write!(out, "\x1b[{};1H", state.terminal_rows)?;
+        writeln!(out)?;
+        state.reserved = 0;
+        state.finished = true;
+        return out.flush();
     }
 
     // Only the lines this display holds are cleared, and only while it still
@@ -1752,6 +1798,10 @@ fn release_progress_region(
 /// is can be asked of a buffer rather than of a terminal. Nothing in this
 /// function knows which stream it draws on.
 fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::io::Result<()> {
+    if state.finished {
+        return Ok(());
+    }
+
     // One line per patch and one for the overall bar. Reserving happens once, and
     // again when that count changes, which it does as the patches become known.
     let wanted = state.patches.len() + 1;
@@ -1759,7 +1809,7 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         // A display that has outgrown the screen was holding a region until now,
         // and hands it back on the way to saying its piece a line at a time.
         if state.reserved > 0 {
-            release_progress_region(state, out)?;
+            release_progress_region(state, out, RegionExit::Erased)?;
         }
         return paint_progress_plain(state, out);
     }
@@ -1976,6 +2026,7 @@ async fn handle_review_command(
         reservation_capable: display.reservation_capable,
         reserved: 0,
         region_rows: 0,
+        finished: false,
     }));
 
     let progress_state_clone = progress_state.clone();
@@ -2102,8 +2153,11 @@ async fn handle_review_command(
                 }
             }
             ProgressEvent::ReviewComplete => {
-                // Ensure overall review is finished and printed lines cleared or kept
-                // Let's not call render_progress here, just print review complete
+                // The region goes back before this prints, and the frame it was
+                // holding stays: it is the review's final state, a hundred per
+                // cent of the stages it ran. So this line, and the report after
+                // it, start below the frame instead of inside it or over it.
+                finish_progress(&mut s);
                 eprintln!("Review complete");
             }
         }
@@ -3180,6 +3234,7 @@ mod tests {
             reservation_capable: display.reservation_capable,
             reserved: 0,
             region_rows: 0,
+            finished: false,
         }
     }
 
@@ -3501,6 +3556,61 @@ mod tests {
     }
 
     #[test]
+    fn test_the_last_frame_is_left_standing_when_the_review_ends() {
+        let mut state = progress_state(reserving((24, 100)));
+        state.patches.insert(1, patch_state(PatchStatus::Queued));
+        paint_progress(&mut state, &mut Buffer::no_color()).expect("paint a frame");
+        assert_eq!((state.reserved, state.region_rows), (2, 24));
+
+        let mut end = Buffer::no_color();
+        release_progress_region(&mut state, &mut end, RegionExit::Kept)
+            .expect("give the screen back");
+        let written = String::from_utf8(end.into_inner()).expect("utf-8");
+
+        // The margins go back, the cursor goes to the last line the display held,
+        // and one newline scrolls the screen so the line after it is free. What
+        // the review prints next — "Review complete", the report — lands there,
+        // leaving the finished frame on screen above it.
+        assert_eq!(written, "\x1b[r\x1b[24;1H\n");
+        assert_eq!(state.reserved, 0);
+
+        // Nothing erased and nothing restored: erasing would take the frame with
+        // it, and a restore would put the cursor back among its rows, which is
+        // how the report came to print over them.
+        assert!(!written.contains("\x1b[2K"), "{written:?}");
+        assert!(!written.contains("\x1b7"), "{written:?}");
+        assert!(!written.contains("\x1b8"), "{written:?}");
+
+        // Said again on the way out, as the review does: a display holding
+        // nothing writes nothing. Handing back margins that are already back
+        // homes the cursor, and the report would print from the top of the screen
+        // over the log that is there.
+        let mut end = Buffer::no_color();
+        release_progress_region(&mut state, &mut end, RegionExit::Kept).expect("say nothing");
+        assert!(end.into_inner().is_empty());
+    }
+
+    #[test]
+    fn test_nothing_paints_once_the_display_has_finished() {
+        let mut state = progress_state(reserving((24, 100)));
+        state.patches.insert(1, patch_state(PatchStatus::Queued));
+        paint_progress(&mut state, &mut Buffer::no_color()).expect("paint a frame");
+
+        let mut end = Buffer::no_color();
+        release_progress_region(&mut state, &mut end, RegionExit::Kept)
+            .expect("give the screen back");
+        assert!(state.finished);
+
+        // The report prints from here, and the resize watcher is still running for
+        // a moment yet: a repaint in that moment would take a region back and draw
+        // across it. So a frame asked for now writes nothing at all.
+        let mut late = Buffer::no_color();
+        paint_progress(&mut state, &mut late).expect("say nothing");
+        assert!(late.into_inner().is_empty());
+        assert_eq!(state.reserved, 0);
+    }
+
+    #[test]
     fn test_a_screen_that_has_shrunk_is_not_cleared_whole() {
         let mut state = progress_state(reserving((24, 100)));
         state.patches.insert(1, patch_state(PatchStatus::Queued));
@@ -3514,7 +3624,8 @@ mod tests {
         // against, so here it clears nothing and hands the margins back.
         state.terminal_rows = 2;
         let mut end = Buffer::no_color();
-        release_progress_region(&mut state, &mut end).expect("give the screen back");
+        release_progress_region(&mut state, &mut end, RegionExit::Erased)
+            .expect("give the screen back");
         let written = String::from_utf8(end.into_inner()).expect("utf-8");
         assert_eq!(written, "\x1b7\x1b[r\x1b8");
         assert_eq!(state.reserved, 0);
@@ -3555,13 +3666,14 @@ mod tests {
         // A region left set is what outlives the process, so it is given back
         // whatever the display thinks it is holding.
         let mut end = Buffer::no_color();
-        release_progress_region(&mut state, &mut end).expect("give the screen back");
+        release_progress_region(&mut state, &mut end, RegionExit::Erased)
+            .expect("give the screen back");
         let written = String::from_utf8(end.into_inner()).expect("utf-8");
         assert_eq!(state.reserved, 0);
 
-        // The two lines it held are cleared, scrolling goes back to the whole
-        // screen, and the cursor is left where the output had reached: whatever
-        // prints next carries on from there rather than from below the frame.
+        // Standing down mid-review: the two lines it held are cleared, scrolling
+        // goes back to the whole screen, and the cursor is left where the output
+        // had reached, since the lines it appends from here carry on from there.
         assert_eq!(
             written,
             "\x1b7\x1b[23;1H\x1b[2K\x1b[24;1H\x1b[2K\x1b[r\x1b8"
@@ -3570,7 +3682,7 @@ mod tests {
         // Said again with nothing held, since a region left set outlives the
         // process and a resize can leave the count behind.
         let mut end = Buffer::no_color();
-        release_progress_region(&mut state, &mut end).expect("say so again");
+        release_progress_region(&mut state, &mut end, RegionExit::Erased).expect("say so again");
         assert_eq!(
             String::from_utf8(end.into_inner()).expect("utf-8"),
             "\x1b7\x1b[r\x1b8"
@@ -3579,7 +3691,7 @@ mod tests {
         // A display that never took a region has none to give back.
         let mut state = progress_state(appending((24, 100)));
         let mut end = Buffer::no_color();
-        release_progress_region(&mut state, &mut end).expect("nothing to do");
+        release_progress_region(&mut state, &mut end, RegionExit::Erased).expect("nothing to do");
         assert!(end.into_inner().is_empty());
     }
 
