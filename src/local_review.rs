@@ -591,6 +591,7 @@ async fn review_single_patch(
                 stages: stages.clone(),
                 skip_report: options.agent,
                 report_preexisting: options.report_preexisting,
+                stage_provenance: settings.review.stage_provenance,
             },
         );
 

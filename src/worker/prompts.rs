@@ -100,6 +100,9 @@ pub struct WorkerConfig {
     pub stages: Option<Vec<String>>,
     pub skip_report: bool,
     pub report_preexisting: bool,
+    /// Whether the report stage is told which stages raised each finding. What
+    /// the review records is not affected by it.
+    pub stage_provenance: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +185,7 @@ pub struct Worker {
     custom_prompt: Option<String>,
     skip_report: bool,
     report_preexisting: bool,
+    stage_provenance: bool,
 }
 
 impl Worker {
@@ -206,6 +210,7 @@ impl Worker {
             custom_prompt: config.custom_prompt,
             skip_report: config.skip_report,
             report_preexisting: config.report_preexisting,
+            stage_provenance: config.stage_provenance,
         }
     }
 
@@ -384,6 +389,7 @@ impl Worker {
             ProjectId::Linux => build_linux_patch_review_workflow_with_options(
                 self.max_interactions,
                 self.temperature,
+                self.stage_provenance,
             ),
             ProjectId::Sashiko => build_sashiko_patch_review_workflow_with_options(
                 self.max_interactions,
@@ -1195,6 +1201,7 @@ mod tests {
             stages: None,
             skip_report: false,
             report_preexisting: false,
+            stage_provenance: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1344,6 +1351,7 @@ mod tests {
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
             report_preexisting: false,
+            stage_provenance: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1381,6 +1389,7 @@ mod tests {
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
             report_preexisting: false,
+            stage_provenance: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1422,6 +1431,7 @@ mod tests {
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
             report_preexisting: false,
+            stage_provenance: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1524,6 +1534,7 @@ mod tests {
             stages: Some(vec!["goal".to_string()]),
             skip_report: false,
             report_preexisting: false,
+            stage_provenance: false,
         };
         let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1708,6 +1719,7 @@ mod tests {
                 stages: Some(vec!["goal".to_string()]),
                 skip_report: true,
                 report_preexisting: false,
+                stage_provenance: false,
             };
             let mut worker = Worker::new(provider, std::sync::Arc::new(tools), prompts, config);
 
@@ -1805,6 +1817,7 @@ mod tests {
                 stages: Some(vec!["goal".to_string()]),
                 skip_report: false,
                 report_preexisting: false,
+                stage_provenance: false,
             },
         );
         let out_default = worker_default
@@ -1836,6 +1849,7 @@ mod tests {
                 stages: Some(vec!["goal".to_string()]),
                 skip_report: false,
                 report_preexisting: true,
+                stage_provenance: false,
             },
         );
         let out_preexisting = worker_preexisting

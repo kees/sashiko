@@ -1927,7 +1927,11 @@ pub fn resolve_post_verification_stages_with_options(
         .collect()
 }
 
-pub fn report_stage(max_turns: usize, temperature: f32) -> Stage<LinuxPatchReviewState, String> {
+pub fn report_stage(
+    max_turns: usize,
+    temperature: f32,
+    stage_provenance: bool,
+) -> Stage<LinuxPatchReviewState, String> {
     Stage::builder(REPORT.name)
         .system_prompt(linux_system_prompt(true))
         .user_prompt(
@@ -1940,8 +1944,17 @@ Findings:
 Return raw text output, not JSON."#
             ))
             .include_file("inline-template.md")
-            .with_var("findings", |s: &LinuxPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+            .with_var("findings", move |s: &LinuxPatchReviewState| {
+                // Labels rather than stage names: the report quotes these to a
+                // reader, and the spelling is the label table's to decide. With
+                // the switch off the key is absent instead, which the template
+                // already reads as nothing to say.
+                let shown = crate::workflows::findings_for_report(
+                    crate::project::ProjectId::Linux,
+                    &s.findings,
+                    stage_provenance,
+                );
+                serde_json::to_string_pretty(&shown).unwrap_or_default()
             }),
         )
         .output_format(OutputFormat::text_with_validator(
@@ -1970,13 +1983,19 @@ Return raw text output, not JSON."#
 
 /// Constructs the complete declarative workflow for Linux kernel patch review.
 pub fn build_linux_patch_review_workflow() -> Workflow<LinuxPatchReviewState> {
-    build_linux_patch_review_workflow_with_options(20, 0.0)
+    build_linux_patch_review_workflow_with_options(20, 0.0, false)
 }
 
-/// Constructs the declarative workflow with custom per-stage interaction limits and temperature.
+/// Constructs the declarative workflow with custom per-stage interaction limits
+/// and temperature.
+///
+/// `stage_provenance` reaches the report stage alone: every other stage carries
+/// the stages a concern came from regardless, because the findings table records
+/// them either way.
 pub fn build_linux_patch_review_workflow_with_options(
     max_turns: usize,
     temperature: f32,
+    stage_provenance: bool,
 ) -> Workflow<LinuxPatchReviewState> {
     Workflow::builder("linux_patch_review")
         .stage(prescreen_stage())
@@ -2000,7 +2019,7 @@ pub fn build_linux_patch_review_workflow_with_options(
             |s| s.findings.is_empty(),
             "No findings validated in verification stages",
         )
-        .stage(report_stage(max_turns, temperature))
+        .stage(report_stage(max_turns, temperature, stage_provenance))
         .build()
 }
 
@@ -2100,7 +2119,7 @@ mod tests {
         // drifting from the table that has to recognise and display it.
         for name in [
             verification_stage(1, 1.0).name(),
-            report_stage(1, 1.0).name(),
+            report_stage(1, 1.0, false).name(),
         ] {
             assert!(is_known_stage(name), "{name} is not in any stage table");
             assert!(stage_short_label(name).is_some(), "{name} has no label");

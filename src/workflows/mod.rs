@@ -109,6 +109,62 @@ pub fn finding_stage_suffix(
     }
 }
 
+/// The findings as a report stage should see them: each `stages` entry replaced
+/// by the label a reader is shown everywhere else.
+///
+/// The stage names in a finding are identifiers — `locking`, `resources` — and
+/// how they are spelled for a reader is decided by the label table, which a
+/// model has no way to consult. So the report is handed the labels themselves
+/// and asked to copy them, rather than the names and a mapping it would have to
+/// invent. What the review persists keeps the names, for anything reading the
+/// findings as data.
+///
+/// `enabled` is review.stage_provenance, and false takes the key out instead of
+/// relabelling it. That is the whole of the switch for a model-written report:
+/// the template already says to name the stages only where a finding carries
+/// them, because verification cannot trace every finding to a stage, so a
+/// finding that arrives without the key produces a report that never mentions
+/// stages. Nothing about the prompt changes, and nothing has to be stripped out
+/// of what the model wrote.
+///
+/// The singular `stage` verification records beside the array goes either way:
+/// it is the first entry's identifier, which would name a stage with the switch
+/// off and set a raw identifier beside its label with it on.
+pub fn findings_for_report(
+    project: ProjectId,
+    findings: &[serde_json::Value],
+    enabled: bool,
+) -> Vec<serde_json::Value> {
+    findings
+        .iter()
+        .map(|finding| {
+            let labels: Vec<&str> = finding
+                .get("stages")
+                .filter(|_| enabled)
+                .and_then(|v| v.as_array())
+                .map(|names| {
+                    names
+                        .iter()
+                        .filter_map(|name| name.as_str())
+                        .filter_map(|name| stage_short_label(project, name))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let mut shown = finding.clone();
+            if let Some(map) = shown.as_object_mut() {
+                map.remove("stage");
+                if labels.is_empty() {
+                    map.remove("stages");
+                } else {
+                    map.insert("stages".to_string(), serde_json::json!(labels));
+                }
+            }
+            shown
+        })
+        .collect()
+}
+
 /// Resolves the ordered list of stages a review will run (analysis fan-out
 /// followed by consolidation stages).
 pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> Vec<String> {
@@ -229,5 +285,56 @@ mod tests {
             json!(["locking", "security"]),
             "the finding itself is untouched either way"
         );
+    }
+
+    #[test]
+    fn test_a_report_is_handed_labels_rather_than_stage_names() {
+        // The report quotes what it is given straight into prose, so it is given
+        // the spelling a reader sees elsewhere. A finding with nothing to say
+        // loses the key rather than carrying an empty array into the prompt.
+        let shown = findings_for_report(
+            ProjectId::Linux,
+            &[
+                json!({"problem": "mm: leak", "stages": ["locking", "security"]}),
+                json!({"problem": "mm: other", "stages": ["not-a-stage"]}),
+                json!({"problem": "mm: third"}),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            shown[0]["stages"],
+            json!(["Locking & Sync", "Security Audit"])
+        );
+        assert!(shown[1].get("stages").is_none());
+        assert!(shown[2].get("stages").is_none());
+
+        // Everything else about a finding is left alone.
+        assert_eq!(shown[0]["problem"], "mm: leak");
+    }
+
+    #[test]
+    fn test_a_report_hears_nothing_of_stages_where_the_switch_is_off() {
+        // The switch for a model-written report is the absence of the key. The
+        // template names stages only where a finding has them, so a report given
+        // findings without them cannot mention them, and no prompt changes.
+        // Verification records the first stage's identifier on its own as well,
+        // and that goes too, or it would name the stage the switch left out.
+        let findings = [json!({"problem": "mm: leak", "stage": "locking", "stages": ["locking"]})];
+
+        let off = findings_for_report(ProjectId::Linux, &findings, false);
+        assert!(off[0].get("stages").is_none(), "{:?}", off[0]);
+        assert!(off[0].get("stage").is_none(), "{:?}", off[0]);
+        assert_eq!(off[0]["problem"], "mm: leak");
+
+        // With the switch on, the labels alone: an identifier beside them is
+        // the spelling the report is handed labels to avoid.
+        let on = findings_for_report(ProjectId::Linux, &findings, true);
+        assert_eq!(on[0]["stages"], json!(["Locking & Sync"]));
+        assert!(on[0].get("stage").is_none(), "{:?}", on[0]);
+
+        // And the findings themselves are untouched, because they are what the
+        // review records.
+        assert_eq!(findings[0]["stages"], json!(["locking"]));
     }
 }
