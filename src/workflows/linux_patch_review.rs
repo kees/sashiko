@@ -1211,7 +1211,13 @@ Return raw text output, not JSON."#
             ))
             .include_file("inline-template.md")
             .with_var("findings", |s: &LinuxPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+                // Labels rather than stage names: the report quotes these to a
+                // reader, and the spelling is the label table's to decide.
+                let shown = crate::workflows::findings_for_report(
+                    crate::project::ProjectId::Linux,
+                    &s.findings,
+                );
+                serde_json::to_string_pretty(&shown).unwrap_or_default()
             }),
         )
         .output_format(OutputFormat::text_with_validator(
