@@ -2523,7 +2523,16 @@ async fn handle_review_command(
                 println!("{}", serde_json::to_string_pretty(&result)?);
             }
             OutputFormat::Text => {
-                print_review_result(&result, &input, report.color, report_preexisting)?;
+                // From the settings this process already read, rather than
+                // asking that file a second question.
+                print_review_result(
+                    &result,
+                    &input,
+                    project,
+                    report.color,
+                    report_preexisting,
+                    settings.review.stage_provenance,
+                )?;
             }
         }
     }
@@ -2558,18 +2567,29 @@ fn current_git_toplevel() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn print_review_result(
     result: &Value,
     input: &str,
+    project: ProjectId,
     color_choice: ColorChoice,
     report_preexisting: bool,
+    stage_provenance: bool,
 ) -> std::io::Result<()> {
     let mut stdout = StandardStream::stdout(color_choice);
-    write_review_result(&mut stdout, result, input, report_preexisting)
+    write_review_result(
+        &mut stdout,
+        result,
+        input,
+        project,
+        report_preexisting,
+        stage_provenance,
+    )
 }
 
 fn write_review_result(
     out: &mut impl WriteColor,
     result: &Value,
     _input: &str,
+    project: ProjectId,
     report_preexisting: bool,
+    stage_provenance: bool,
 ) -> std::io::Result<()> {
     if let Some(error) = result.get("error").and_then(|v| v.as_str())
         && !error.is_empty()
@@ -2602,14 +2622,24 @@ fn write_review_result(
     } else if total > 0 {
         writeln!(out, "\nFindings:")?;
         write_finding_counts(out, &counts)?;
-        write_grouped_findings(out, &patch_findings, false)?;
+        let style = FindingStyle {
+            include_details: false,
+            project,
+            stage_provenance,
+        };
+        write_grouped_findings(out, &patch_findings, style)?;
     }
 
     if report_preexisting && !preexisting_findings.is_empty() {
         let preexisting_counts = count_findings_slice(&preexisting_findings);
         writeln!(out, "\nPre-existing Findings:")?;
         write_finding_counts(out, &preexisting_counts)?;
-        write_grouped_findings(out, &preexisting_findings, true)?;
+        let style = FindingStyle {
+            include_details: true,
+            project,
+            stage_provenance,
+        };
+        write_grouped_findings(out, &preexisting_findings, style)?;
     }
 
     if let Some(inline) = result.get("inline_review").and_then(|v| v.as_str())
@@ -2670,10 +2700,19 @@ fn write_finding_counts(out: &mut impl WriteColor, counts: &FindingCounts) -> st
     writeln!(out, "\n")
 }
 
+/// How a finding is written: with or without its locations and rationale, and
+/// with or without the stages that raised it, named in the project's terms.
+#[derive(Clone, Copy)]
+struct FindingStyle {
+    include_details: bool,
+    project: ProjectId,
+    stage_provenance: bool,
+}
+
 fn write_grouped_findings(
     out: &mut impl WriteColor,
     findings: &[&Value],
-    include_details: bool,
+    style: FindingStyle,
 ) -> std::io::Result<()> {
     let mut grouped_findings: std::collections::BTreeMap<i64, Vec<&Value>> =
         std::collections::BTreeMap::new();
@@ -2699,7 +2738,7 @@ fn write_grouped_findings(
         }
         writeln!(out, " ---")?;
         for finding in patch_findings {
-            write_finding(out, finding, include_details)?;
+            write_finding(out, finding, style)?;
         }
         writeln!(out)?;
     }
@@ -2707,7 +2746,7 @@ fn write_grouped_findings(
     if !ungrouped_findings.is_empty() {
         writeln!(out, "  --- General Findings ---")?;
         for finding in ungrouped_findings {
-            write_finding(out, finding, include_details)?;
+            write_finding(out, finding, style)?;
         }
     }
 
@@ -2726,7 +2765,7 @@ fn severity_color(severity: &str) -> Color {
 fn write_finding(
     out: &mut impl WriteColor,
     finding: &Value,
-    include_details: bool,
+    style: FindingStyle,
 ) -> std::io::Result<()> {
     let severity = finding
         .get("severity")
@@ -2740,9 +2779,13 @@ fn write_finding(
 
     write!(out, "  ")?;
     write_colored(out, color, &format!("[{}] ", severity))?;
-    writeln!(out, "{}", problem)?;
+    writeln!(
+        out,
+        "{problem}{}",
+        sashiko::workflows::finding_stage_suffix(style.project, finding, style.stage_provenance)
+    )?;
 
-    if include_details {
+    if style.include_details {
         write_locations(out, finding)?;
         if let Some(rationale) = finding
             .get("severity_explanation")
@@ -3772,7 +3815,7 @@ mod tests {
         });
 
         let mut buf = Buffer::no_color();
-        write_review_result(&mut buf, &result, "HEAD", true).unwrap();
+        write_review_result(&mut buf, &result, "HEAD", ProjectId::Linux, true, false).unwrap();
         let output = String::from_utf8(buf.into_inner()).unwrap();
 
         assert!(output.contains("No patch-introduced issues found."));
@@ -3789,7 +3832,15 @@ mod tests {
         assert!(output.contains("This problem wasn't introduced by this patch, but"));
 
         let mut default_buf = Buffer::no_color();
-        write_review_result(&mut default_buf, &result, "HEAD", false).unwrap();
+        write_review_result(
+            &mut default_buf,
+            &result,
+            "HEAD",
+            ProjectId::Linux,
+            false,
+            false,
+        )
+        .unwrap();
         let default_output = String::from_utf8(default_buf.into_inner()).unwrap();
         assert!(default_output.contains("\nNo issues found.\n"));
         assert!(!default_output.contains("Pre-existing Findings:"));

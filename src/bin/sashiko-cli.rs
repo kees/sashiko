@@ -42,6 +42,19 @@ fn project() -> ProjectId {
     PROJECT.get().copied().unwrap_or_default()
 }
 
+/// Whether to name the stages behind a finding, held the same way and read from
+/// this client's own settings.
+///
+/// The client's configuration rather than the server's, which is the only one it
+/// has: it reads findings over HTTP and the server does not say how it would
+/// have printed them. A reader who wants the provenance turns it on where they
+/// read it.
+static STAGE_PROVENANCE: OnceLock<bool> = OnceLock::new();
+
+fn stage_provenance() -> bool {
+    STAGE_PROVENANCE.get().copied().unwrap_or(false)
+}
+
 #[derive(Parser)]
 #[command(name = "sashiko-cli")]
 #[command(about = "CLI tool for interacting with Sashiko", long_about = None)]
@@ -357,10 +370,19 @@ async fn main() -> Result<()> {
     // Same precedence as the server: the flag, then what the settings file
     // says it is for, then the default. A missing or unreadable settings file
     // is not fatal here, since most commands only talk to a running server.
-    let configured_project = Settings::new().ok().and_then(|s| s.project.kind);
+    let settings = Settings::new().ok();
+    let configured_project = settings.as_ref().and_then(|s| s.project.kind);
     PROJECT
         .set(cli.project.or(configured_project).unwrap_or_default())
         .expect("project is set exactly once, here");
+    STAGE_PROVENANCE
+        .set(
+            settings
+                .as_ref()
+                .map(|s| s.review.stage_provenance)
+                .unwrap_or(false),
+        )
+        .expect("stage provenance is set exactly once, here");
 
     let client = build_client(cli.token.as_deref())?;
 
@@ -2453,7 +2475,10 @@ fn print_findings_summary(
         };
 
         print_colored(color, &format!("  {}[{}] ", location, sev));
-        println!("{}", desc);
+        println!(
+            "{desc}{}",
+            sashiko::workflows::finding_stage_suffix(project(), f, stage_provenance())
+        );
         if !fix.is_empty() {
             println!("    Fix: {}", fix);
         }

@@ -54,6 +54,61 @@ pub fn is_counted_stage(project: ProjectId, name: &str) -> bool {
     stage_short_label(project, name).is_some() || matches!(name, "pre-screen" | "planning")
 }
 
+/// The stages behind a finding, as a suffix for a one-line report of it:
+/// `" (Resource Mgmt)"`, or `" (Locking & Sync, Security Audit)"` where more
+/// than one stage raised it.
+///
+/// Empty when the finding names no stage, which is what verification leaves
+/// when it could not trace a finding to the items it came from, so a caller
+/// can append this without asking first. A name with no short label is left out
+/// rather than printed raw: the label table is what decides how a stage is
+/// spelled for a reader.
+///
+/// `project` says which table to spell them from, and the other project's table
+/// answers whatever it cannot. A caller does not always know which project
+/// produced a finding: the remote client reads findings from a server that may
+/// review a different one, and has only its own configuration to go on, so
+/// insisting on its guess would drop every label for a review it did not run.
+///
+/// `enabled` is review.stage_provenance, and false answers with nothing at all.
+/// The switch lives here rather than at each caller so that adding a fourth
+/// place that reports findings cannot forget to consult it: a caller appends
+/// what this returns, and what it returns is already the deployment's answer.
+pub fn finding_stage_suffix(
+    project: ProjectId,
+    finding: &serde_json::Value,
+    enabled: bool,
+) -> String {
+    if !enabled {
+        return String::new();
+    }
+
+    let label = |name: &str| {
+        stage_short_label(project, name).or_else(|| match project {
+            ProjectId::Linux => stage_short_label(ProjectId::Sashiko, name),
+            ProjectId::Sashiko => stage_short_label(ProjectId::Linux, name),
+        })
+    };
+
+    let labels: Vec<&str> = finding
+        .get("stages")
+        .and_then(|v| v.as_array())
+        .map(|names| {
+            names
+                .iter()
+                .filter_map(|name| name.as_str())
+                .filter_map(label)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if labels.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", labels.join(", "))
+    }
+}
+
 /// Resolves the ordered list of stages a review will run (analysis fan-out
 /// followed by consolidation stages).
 pub fn planned_stages_from(project: ProjectId, stage_names: &[&'static str]) -> Vec<String> {
@@ -109,4 +164,70 @@ pub fn refine_planned_stages_with_post_verification(
         }
     }
     updated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_a_findings_stages_are_named_by_their_labels() {
+        let suffix = |finding| finding_stage_suffix(ProjectId::Linux, &finding, true);
+
+        assert_eq!(suffix(json!({"stages": ["resources"]})), " (Resource Mgmt)");
+        assert_eq!(
+            suffix(json!({"stages": ["locking", "security"]})),
+            " (Locking & Sync, Security Audit)"
+        );
+
+        // Nothing to say, said as nothing: a caller appends this either way, and
+        // a finding verification could not trace reads as it did before.
+        assert_eq!(suffix(json!({"problem": "mm: leak"})), "");
+        assert_eq!(suffix(json!({"stages": []})), "");
+
+        // A name the label table does not know is left out rather than printed
+        // raw, so the reader only ever sees stages this review has.
+        assert_eq!(suffix(json!({"stages": ["not-a-stage"]})), "");
+        assert_eq!(
+            suffix(json!({"stages": ["not-a-stage", "locking"]})),
+            " (Locking & Sync)"
+        );
+
+        // A stage only the other project has is still spelled out. The remote
+        // client reads findings from a server that may review a project its own
+        // configuration does not name, and dropping the label there would leave a
+        // reader with no provenance at all rather than the wrong word for it.
+        assert_eq!(
+            finding_stage_suffix(ProjectId::Linux, &json!({"stages": ["llm-pipeline"]}), true),
+            " (LLM Pipeline)"
+        );
+        assert_eq!(
+            finding_stage_suffix(ProjectId::Sashiko, &json!({"stages": ["hardware"]}), true),
+            " (Hardware Review)"
+        );
+    }
+
+    #[test]
+    fn test_nothing_is_named_where_the_deployment_did_not_ask() {
+        // review.stage_provenance off: the finding still carries its stages,
+        // because the review recorded them and the table keeps them. Only the
+        // line a reader sees goes back to what it was.
+        let finding = json!({"stages": ["locking", "security"]});
+        assert_eq!(
+            finding_stage_suffix(ProjectId::Linux, &finding, false),
+            "",
+            "the switch is off, so the suffix says nothing"
+        );
+        assert_eq!(
+            finding_stage_suffix(ProjectId::Linux, &finding, true),
+            " (Locking & Sync, Security Audit)",
+            "the same finding, with the switch on"
+        );
+        assert_eq!(
+            finding["stages"],
+            json!(["locking", "security"]),
+            "the finding itself is untouched either way"
+        );
+    }
 }
