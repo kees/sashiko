@@ -1051,7 +1051,13 @@ Return strictly plain text output (no markdown, no backticks, wrapped at 78 char
             ))
             .include_file("github-summary-template.md")
             .with_var("findings", |s: &SashikoPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+                // Labels rather than stage names, as in the kernel workflow: the
+                // report quotes these to a reader.
+                let shown = crate::workflows::findings_for_report(
+                    crate::project::ProjectId::Sashiko,
+                    &s.findings,
+                );
+                serde_json::to_string_pretty(&shown).unwrap_or_default()
             }),
         )
         .output_format(OutputFormat::text_with_validator(
