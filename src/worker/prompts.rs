@@ -394,6 +394,7 @@ impl Worker {
             ProjectId::Sashiko => build_sashiko_patch_review_workflow_with_options(
                 self.max_interactions,
                 self.temperature,
+                self.stage_provenance,
             ),
         };
         let env = WorkflowEnv {

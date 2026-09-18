@@ -1104,7 +1104,11 @@ pub fn resolve_post_verification_stages_with_options(
         .collect()
 }
 
-pub fn report_stage(max_turns: usize, temperature: f32) -> Stage<SashikoPatchReviewState, String> {
+pub fn report_stage(
+    max_turns: usize,
+    temperature: f32,
+    stage_provenance: bool,
+) -> Stage<SashikoPatchReviewState, String> {
     Stage::builder(REPORT.name)
         .system_prompt(sashiko_system_prompt(true))
         .user_prompt(
@@ -1121,8 +1125,16 @@ Findings:
 Return strictly plain text output (no markdown, no backticks, wrapped at 78 characters), not JSON."#
             ))
             .include_file("github-summary-template.md")
-            .with_var("findings", |s: &SashikoPatchReviewState| {
-                serde_json::to_string_pretty(&s.findings).unwrap_or_default()
+            .with_var("findings", move |s: &SashikoPatchReviewState| {
+                // Labels rather than stage names, as in the kernel workflow: the
+                // report quotes these to a reader. And as there, the switch off
+                // means the key is absent rather than the template differing.
+                let shown = crate::workflows::findings_for_report(
+                    crate::project::ProjectId::Sashiko,
+                    &s.findings,
+                    stage_provenance,
+                );
+                serde_json::to_string_pretty(&shown).unwrap_or_default()
             }),
         )
         .output_format(OutputFormat::text_with_validator(
@@ -1182,7 +1194,7 @@ pub fn summary_stage(
 // ---------------------------------------------------------------------------
 
 pub fn build_sashiko_patch_review_workflow() -> Workflow<SashikoPatchReviewState> {
-    build_sashiko_patch_review_workflow_with_options(20, 0.0)
+    build_sashiko_patch_review_workflow_with_options(20, 0.0, false)
 }
 
 /// Builds the Sashiko patch review workflow.
@@ -1195,9 +1207,13 @@ pub fn build_sashiko_patch_review_workflow() -> Workflow<SashikoPatchReviewState
 /// [`resolve_post_verification_stages_with_options`] (when `hard_cases` is
 /// empty), and `skip_if` on [`report_stage`] (when `findings` is empty) rather
 /// than `early_exit_if`, which would abort the workflow before `summary_stage`.
+///
+/// `stage_provenance` reaches the report stage alone, as in the kernel
+/// workflow: a review records the stages behind a finding whatever it says.
 pub fn build_sashiko_patch_review_workflow_with_options(
     max_turns: usize,
     temperature: f32,
+    stage_provenance: bool,
 ) -> Workflow<SashikoPatchReviewState> {
     Workflow::builder("sashiko_patch_review")
         .stage(prescreen_stage())
@@ -1213,7 +1229,7 @@ pub fn build_sashiko_patch_review_workflow_with_options(
             },
             ParallelPolicy::BestEffort,
         )
-        .stage(report_stage(max_turns, temperature))
+        .stage(report_stage(max_turns, temperature, stage_provenance))
         .stage(summary_stage(max_turns, temperature))
         .build()
 }
