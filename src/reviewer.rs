@@ -2616,6 +2616,7 @@ impl Reviewer {
 
                     sorted_findings.sort_by(sort_by_severity);
 
+                    let project = ctx.settings.project.kind.unwrap_or_default();
                     let format_finding = |f: &Value| {
                         let problem = f
                             .get("problem")
@@ -2626,7 +2627,12 @@ impl Reviewer {
                             .get("severity")
                             .and_then(|v| v.as_str())
                             .unwrap_or("Unknown");
-                        format!("- [{}] {}\n", severity, problem)
+                        format!(
+                            "- [{}] {}{}\n",
+                            severity,
+                            problem,
+                            crate::workflows::finding_stage_suffix(project, f)
+                        )
                     };
 
                     for f in &sorted_findings {

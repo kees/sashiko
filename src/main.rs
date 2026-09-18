@@ -2152,7 +2152,7 @@ async fn handle_review_command(
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
         OutputFormat::Text => {
-            print_review_result(&result, &input, report.color)?;
+            print_review_result(&result, &input, project, report.color)?;
         }
     }
 
@@ -2186,6 +2186,7 @@ fn current_git_toplevel() -> Result<PathBuf, Box<dyn std::error::Error>> {
 fn print_review_result(
     result: &Value,
     _input: &str,
+    project: ProjectId,
     color_choice: ColorChoice,
 ) -> std::io::Result<()> {
     if let Some(error) = result.get("error").and_then(|v| v.as_str())
@@ -2245,7 +2246,7 @@ fn print_review_result(
             }
             println!(" ---");
             for finding in patch_findings {
-                print_finding(finding, color_choice)?;
+                print_finding(finding, project, color_choice)?;
             }
             println!();
         }
@@ -2253,7 +2254,7 @@ fn print_review_result(
         if !ungrouped_findings.is_empty() {
             println!("  --- General Findings ---");
             for finding in ungrouped_findings {
-                print_finding(finding, color_choice)?;
+                print_finding(finding, project, color_choice)?;
             }
         }
     }
@@ -2303,7 +2304,11 @@ fn print_review_result(
     Ok(())
 }
 
-fn print_finding(finding: &Value, color_choice: ColorChoice) -> std::io::Result<()> {
+fn print_finding(
+    finding: &Value,
+    project: ProjectId,
+    color_choice: ColorChoice,
+) -> std::io::Result<()> {
     let severity = finding
         .get("severity")
         .and_then(|v| v.as_str())
@@ -2321,7 +2326,10 @@ fn print_finding(finding: &Value, color_choice: ColorChoice) -> std::io::Result<
 
     print!("  ");
     print_colored(color_choice, color, &format!("[{}] ", severity))?;
-    println!("{}", problem);
+    println!(
+        "{problem}{}",
+        sashiko::workflows::finding_stage_suffix(project, finding)
+    );
     Ok(())
 }
 
