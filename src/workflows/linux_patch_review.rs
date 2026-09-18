@@ -427,7 +427,7 @@ fn append_stage_items(
 
 /// The stages that raised something, taken from what the analysis fan-out
 /// tagged: the only names a consolidation stage may claim provenance from.
-fn stages_that_raised(tagged: &[&[Value]]) -> std::collections::BTreeSet<String> {
+pub(crate) fn stages_that_raised(tagged: &[&[Value]]) -> std::collections::BTreeSet<String> {
     tagged
         .iter()
         .flat_map(|items| items.iter())
@@ -444,7 +444,10 @@ fn stages_that_raised(tagged: &[&[Value]]) -> std::collections::BTreeSet<String>
 /// about the patch, and saying nothing is better than crediting a stage that
 /// never ran. Accepts the `stage` string the analysis stages write as well, so
 /// an item that came through untouched still ends up with the array.
-fn keep_stages_that_raised(items: &mut [Value], raised: &std::collections::BTreeSet<String>) {
+pub(crate) fn keep_stages_that_raised(
+    items: &mut [Value],
+    raised: &std::collections::BTreeSet<String>,
+) {
     let items_seen = items.len();
     let mut unaccounted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut malformed = 0usize;
