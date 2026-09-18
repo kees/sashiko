@@ -2026,6 +2026,13 @@ async fn handle_review_command(
                     patches,
                     if patches == 1 { "" } else { "es" }
                 );
+
+                // The first frame, drawn before any stage has started. Every
+                // patch is known and queued by now, and the work between here
+                // and the first stage — a provider each, a cache to open, a git
+                // call per patch — is time the display would otherwise spend
+                // blank, with the count it is about to report already settled.
+                render_progress(&mut s);
             }
             ProgressEvent::AiReviewPreScreenStarted { patch_index } => {
                 if let Some(p) = s.patches.get_mut(&patch_index) {
