@@ -1209,7 +1209,15 @@ pub fn build_sashiko_patch_review_workflow_with_options(
     temperature: f32,
 ) -> Workflow<SashikoPatchReviewState> {
     Workflow::builder("sashiko_patch_review")
-        .stage(prescreen_stage())
+        // As in the kernel workflow: the pre-screen reads none of what the
+        // prefetch gathers, so they share a step.
+        .parallel(
+            vec![
+                Box::new(prescreen_stage()),
+                Box::new(crate::workflows::linux_patch_review::SourcePrefetchStage),
+            ],
+            ParallelPolicy::FailFast,
+        )
         .dynamic_parallel(
             planning_stage(),
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),

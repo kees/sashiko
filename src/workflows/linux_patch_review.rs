@@ -22,11 +22,12 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::workflow::events::WorkflowEvent;
 use crate::workflow::graph::Workflow;
 use crate::workflow::output::OutputFormat;
 use crate::workflow::policy::{ParallelPolicy, RecitationPolicy, StagePolicy, ToolScope};
 use crate::workflow::prompt::PromptTemplate;
-use crate::workflow::stage::{ExecutableStage, Stage};
+use crate::workflow::stage::{ExecutableStage, Stage, StageOutcome, StateMutation, WorkflowEnv};
 
 /// Complete execution state of a Linux kernel patch review.
 #[derive(Clone, Debug, Default)]
@@ -1159,6 +1160,85 @@ pub fn enrich_post_verification_output(
 // Stage Definitions
 // ---------------------------------------------------------------------------
 
+/// Reads the source the patch touches, and the definitions it refers to, out of
+/// the target commit.
+///
+/// A stage rather than a step taken before the workflow, so it can share a
+/// parallel step with the pre-screen: it is the longest thing a review does
+/// before its first model call, and nothing reads what it gathers until the
+/// stage after that step. Whatever runs there — the planner, or an analysis
+/// stage where `--stages` skipped the planner — reads it from state that the
+/// step has already settled, so the dependency holds however the review was
+/// asked for.
+///
+/// Takes no permits and no turns, and reports both as zero, which keeps it out
+/// of the token accounting while leaving it a stage the display can name.
+pub struct SourcePrefetchStage;
+
+#[async_trait::async_trait]
+impl ExecutableStage<LinuxPatchReviewState> for SourcePrefetchStage {
+    fn name(&self) -> &'static str {
+        PREFETCH_STAGE
+    }
+
+    async fn execute_isolated(
+        &self,
+        env: &WorkflowEnv<'_>,
+        state: &LinuxPatchReviewState,
+        event_cb: Option<&(dyn Fn(WorkflowEvent) + Send + Sync)>,
+    ) -> Result<(StageOutcome, StateMutation<LinuxPatchReviewState>), anyhow::Error> {
+        if let Some(cb) = event_cb {
+            cb(WorkflowEvent::StageStarted {
+                stage_name: self.name(),
+            });
+        }
+
+        // Failure is reported to the review rather than to the engine. The
+        // prompt tells the model to gather the source with the git tools when
+        // this is set, which is what it did before this was a stage, and an
+        // error here would take down the stage beside it under FailFast.
+        let (prefetched_context, prefetch_failed) = match crate::worker::prefetch::prefetch_context(
+            env.tools.get_worktree_path(),
+            &state.target_commit_sha,
+            &state.target_commit_diff,
+        )
+        .await
+        {
+            Ok(context) => (context, false),
+            Err(error) => {
+                tracing::warn!(
+                    target_commit = %state.target_commit_sha,
+                    %error,
+                    "Source prefetch failed; review must retrieve context with Git tools"
+                );
+                (String::new(), true)
+            }
+        };
+
+        if let Some(cb) = event_cb {
+            cb(WorkflowEvent::StageFinished {
+                stage_name: self.name(),
+                tokens_in: 0,
+                tokens_out: 0,
+                tokens_cached: 0,
+            });
+        }
+
+        Ok((
+            StageOutcome {
+                tokens_in: 0,
+                tokens_out: 0,
+                tokens_cached: 0,
+                history: Vec::new(),
+            },
+            Box::new(move |s: &mut LinuxPatchReviewState| {
+                s.prefetched_context = prefetched_context;
+                s.prefetch_failed = prefetch_failed;
+            }),
+        ))
+    }
+}
+
 pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
     Stage::builder(PRESCREEN_STAGE)
         .system_prompt(PromptTemplate::<LinuxPatchReviewState>::new(
@@ -1519,6 +1599,9 @@ pub const PRESCREEN_STAGE: &str = "pre-screen";
 /// Not nameable in `--stages`. It chooses which stages run, so naming stages
 /// has already answered it and it is skipped either way.
 pub const PLANNING_STAGE: &str = "planning";
+/// Not nameable in `--stages`. It gathers the source every later stage reads,
+/// so there is no review to run without it.
+pub const PREFETCH_STAGE: &str = "prefetch";
 
 /// Every stage name a review can produce, analysis and consolidation alike,
 /// for validating what a caller or the planner asked for.
@@ -1526,7 +1609,10 @@ pub fn is_known_stage(name: &str) -> bool {
     let normalized = normalize_stage_name(name);
     analysis_stage_by_name(&normalized).is_some()
         || consolidation_stage_by_name(&normalized).is_some()
-        || matches!(normalized.as_str(), PRESCREEN_STAGE | PLANNING_STAGE)
+        || matches!(
+            normalized.as_str(),
+            PRESCREEN_STAGE | PLANNING_STAGE | PREFETCH_STAGE
+        )
 }
 
 /// Whether naming stages leaves the pre-screen out.
@@ -2076,7 +2162,14 @@ pub fn build_linux_patch_review_workflow_with_options(
     temperature: f32,
 ) -> Workflow<LinuxPatchReviewState> {
     Workflow::builder("linux_patch_review")
-        .stage(prescreen_stage())
+        // The pre-screen picks guides from the diff and the guide index, so it
+        // wants nothing the prefetch gathers and the two can run together.
+        // FailFast, because a pre-screen that fails failed the review before
+        // this step existed and still should.
+        .parallel(
+            vec![Box::new(prescreen_stage()), Box::new(SourcePrefetchStage)],
+            ParallelPolicy::FailFast,
+        )
         .dynamic_parallel(
             planning_stage(),
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),
@@ -2904,6 +2997,29 @@ mod tests {
         let workflow = build_linux_patch_review_workflow();
         assert_eq!(workflow.name, "linux_patch_review");
         assert_eq!(workflow.steps.len(), 6);
+    }
+
+    #[test]
+    fn test_the_prefetch_shares_its_step_with_the_pre_screen() {
+        // Together in one step, so the prefetch overlaps a model call rather
+        // than delaying one, and finished before the step that reads what it
+        // gathered: the planner, or an analysis stage where --stages skipped the
+        // planner. A step of its own ahead of them would serialize it again.
+        let workflow = build_linux_patch_review_workflow();
+        let names = match workflow.steps.first().expect("a first step") {
+            crate::workflow::graph::WorkflowStep::Parallel { stages, policy } => {
+                // FailFast: a pre-screen that fails failed the review before it
+                // shared a step, and still has to.
+                assert!(matches!(policy, ParallelPolicy::FailFast), "{policy:?}");
+                stages.iter().map(|s| s.name()).collect::<Vec<_>>()
+            }
+            _ => panic!("the pre-screen and the prefetch must share a parallel step"),
+        };
+        assert!(names.contains(&PRESCREEN_STAGE), "{names:?}");
+        assert!(names.contains(&PREFETCH_STAGE), "{names:?}");
+
+        // And nothing that reads the context runs inside that step.
+        assert!(!names.contains(&PLANNING_STAGE), "{names:?}");
     }
 
     #[test]
