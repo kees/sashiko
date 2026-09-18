@@ -1660,20 +1660,16 @@ fn worth_reserving(wanted: usize, rows: usize) -> bool {
 ///
 /// The room is scrolled for at the foot of the screen, which is the only place a
 /// newline is certain to scroll rather than to step onto a line that is already
-/// free. The output then carries on from the line it had reached, which that
-/// scrolling moved up by as many lines as were taken: saved beforehand, restored
-/// after, and walked up by that many.
+/// free: every line taken comes from somewhere.
 ///
-/// Walking it up is what keeps it inside the new region. A line at the foot of an
-/// old one would otherwise be left below the new bottom margin, where output
-/// neither scrolls nor moves on, and the log would sit there overwriting the
-/// first line of the frame.
+/// Leaves the cursor at the top of the screen, because DECSTBM homes it and the
+/// form that gives the margins back homes it too. Nothing here puts it back,
+/// since there is nowhere safe to put it back to while the margins are moving;
+/// the caller parks it on the last line of the region once they are settled.
 ///
-/// DECSTBM homes the cursor, and so does the form that gives the margins back,
-/// so every one of them here sits between a save and a restore. Without that the
-/// room is made from the top of the screen rather than from the line the output
-/// reached, which scrolls nothing and leaves nothing free, and the log carries on
-/// at the top of the screen over what is already there.
+/// Run for every frame rather than only where the geometry changed, so it has to
+/// be safe against margins it has already set, which it is: the escapes say the
+/// same thing again and no room is asked for twice.
 ///
 /// Asked for only where those lines are worth taking, so the caller has already
 /// left something to scroll in.
@@ -1682,31 +1678,21 @@ fn reserve_progress_region(
     out: &mut impl WriteColor,
     wanted: usize,
 ) -> std::io::Result<()> {
+    // Hand back whatever is held first, so the newlines below scroll the whole
+    // screen rather than the part above a region, and so the lines held are the
+    // only thing this has to be right about.
+    write!(out, "\x1b[r")?;
+
+    // Room for the lines not held yet, scrolled for at the foot of the screen,
+    // where a newline can only scroll: every line taken comes from somewhere.
     let room = wanted.saturating_sub(state.reserved);
-    if room > 0 {
-        // Where the output has reached, to come back to.
-        write!(out, "\x1b7")?;
-
-        // The whole screen, so the newlines scroll all of it rather than the
-        // part above a region already held.
-        if state.reserved > 0 {
-            write!(out, "\x1b[r")?;
-        }
-
-        // At the foot of the screen a newline can only scroll, which is the
-        // point: every line taken has to come from somewhere.
-        write!(out, "\x1b[{};1H", state.terminal_rows)?;
-        for _ in 0..room {
-            writeln!(out)?;
-        }
-
-        // Back to the output's line, which that scrolling moved up by as many
-        // lines as were taken, and which is therefore inside the new region.
-        write!(out, "\x1b8\x1b[{room}A")?;
+    write!(out, "\x1b[{};1H", state.terminal_rows)?;
+    for _ in 0..room {
+        writeln!(out)?;
     }
 
     let split = state.terminal_rows - wanted;
-    write!(out, "\x1b7\x1b[1;{split}r\x1b8")?;
+    write!(out, "\x1b[1;{split}r")?;
 
     state.reserved = wanted;
     state.region_rows = state.terminal_rows;
@@ -1772,14 +1758,12 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         return paint_progress_plain(state, out);
     }
 
-    // A resize moves the foot of the screen, so the region is set again for the
-    // new height as well as for a new count of lines.
-    if wanted != state.reserved || state.terminal_rows != state.region_rows {
-        reserve_progress_region(state, out, wanted)?;
-    }
-    // Save the cursor before addressing those lines and put it back after:
-    // ordinary output carries on above, where it left off.
-    write!(out, "\x1b7")?;
+    // Asserted on every frame, not only when the count of lines or the height of
+    // the screen changes. Anything can give the margins back without saying so:
+    // tmux redrawing a pane, another program, a stray reset. A frame that took
+    // the last one on trust would then paint its lines into a screen that
+    // scrolls them away.
+    reserve_progress_region(state, out, wanted)?;
 
     let mut lines_printed = 0;
     let limit = state.terminal_width.saturating_sub(5);
@@ -1872,7 +1856,21 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         let _ = tw.write_segment(out, &stats, None, false);
     }
 
-    write!(out, "\x1b8")?;
+    // The last line of the region, which is where ordinary output carries on
+    // from. Parked outright rather than saved and restored: a restore puts the
+    // cursor back where it was, and where it was can be outside the region a
+    // resize has just moved, which leaves every log record overwriting the same
+    // row with no way back. The column is lost with it, so a record written
+    // without a newline would be overwritten; the log writes whole lines.
+    //
+    // On a screen with room to spare this pulls the log down to meet the display
+    // and leaves a blank band above it until the output scrolls that away, which
+    // is the price of not knowing the row the log had reached.
+    write!(
+        out,
+        "\x1b[{split};1H",
+        split = state.terminal_rows - state.reserved
+    )?;
     out.flush()
 }
 
@@ -3415,20 +3413,21 @@ mod tests {
             "walked the cursor: {painted:?}"
         );
 
-        // The cursor is put back where the log left it, so ordinary output
-        // carries on above.
-        assert!(painted.contains("\x1b7"), "{painted:?}");
-        assert!(painted.ends_with("\x1b8"), "{painted:?}");
+        // The cursor ends on the last line of the region, which is where
+        // ordinary output carries on from. Nothing is saved or restored.
+        assert!(painted.ends_with("\x1b[22;1H"), "{painted:?}");
+        assert!(!painted.contains("\x1b7"), "saved the cursor: {painted:?}");
+        assert!(
+            !painted.contains("\x1b8"),
+            "restored the cursor: {painted:?}"
+        );
 
-        // Reserving happens once. A second frame addresses the same lines and
-        // sets no region again.
+        // Every frame asserts the region, not only the first: anything can hand
+        // the margins back without saying so.
         let mut frame = Buffer::no_color();
         paint_progress(&mut state, &mut frame).expect("paint a frame");
         let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
-        assert!(
-            !painted.contains("\x1b[1;22r"),
-            "reserved twice: {painted:?}"
-        );
+        assert!(painted.contains("\x1b[1;22r"), "{painted:?}");
         assert!(painted.contains("\x1b[23;1H\x1b[2K"), "{painted:?}");
 
         // A patch more is a line more, so the region is set again.
@@ -3449,38 +3448,22 @@ mod tests {
         paint_progress(&mut state, &mut frame).expect("paint a frame");
         let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
 
-        // Two lines of room, made with newlines from wherever the output had
-        // reached: on a full screen those scroll, and on one with space below
-        // they cost nothing. The cursor then goes back up the same two lines, so
-        // the output carries on where it was rather than at a row counted from
-        // the top of the screen, and nothing on screen is written over.
         // Two lines scrolled for at row 24, the foot of the screen, where a
-        // newline can only scroll. The output's line is saved beforehand and
-        // restored after, then walked up the two lines the scrolling moved it.
-        // Nothing hands back a region the first time, there being none yet.
-        let frame = painted.rfind("\x1b7").expect("a frame follows");
-        let reserving = &painted[..frame];
-        assert_eq!(
-            reserving,
-            "\x1b7\x1b[24;1H\n\n\x1b8\x1b[2A\x1b7\x1b[1;22r\x1b8"
-        );
+        // newline can only scroll. The region is handed back first, so those
+        // newlines scroll all of the screen rather than the part above a region
+        // already held, and the frame that follows is addressed outright.
+        let addressed = painted.find("\x1b[23;1H").expect("a frame follows");
+        assert_eq!(&painted[..addressed], "\x1b[r\x1b[24;1H\n\n\x1b[1;22r");
 
-        // A patch more wants a line more. The region held is handed back first, so
-        // the newline scrolls the whole screen rather than the part above it.
+        // A patch more wants a line more, so one line more is scrolled for and
+        // the region moves up with it.
         state.patches.insert(2, patch_state(PatchStatus::Reviewing));
         let mut frame = Buffer::no_color();
         paint_progress(&mut state, &mut frame).expect("paint a frame");
         let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
-        let reserving = &painted[..painted.rfind("\x1b7").expect("a frame follows")];
-        assert_eq!(
-            reserving,
-            "\x1b7\x1b[r\x1b[24;1H\n\x1b8\x1b[1A\x1b7\x1b[1;21r\x1b8"
-        );
-
-        // That last move up is what keeps the output inside the region it just
-        // made: a line at the foot of the old one would otherwise be left below
-        // the new bottom margin, on the frame's first line.
-        assert!(reserving.ends_with("\x1b[1;21r\x1b8"), "{reserving:?}");
+        let addressed = painted.find("\x1b[22;1H\x1b[2K").expect("a frame follows");
+        assert_eq!(&painted[..addressed], "\x1b[r\x1b[24;1H\n\x1b[1;21r");
+        assert!(painted.ends_with("\x1b[21;1H"), "{painted:?}");
     }
 
     #[test]
@@ -3510,14 +3493,12 @@ mod tests {
         paint_progress(&mut state, &mut Buffer::no_color()).expect("paint a frame");
         assert_eq!((state.reserved, state.region_rows), (2, 24));
 
-        // The same two lines, and nothing to do about them.
-        let mut frame = Buffer::no_color();
-        paint_progress(&mut state, &mut frame).expect("paint a frame");
-        let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
-        assert!(!painted.contains("\x1b[1;"), "reserved again: {painted:?}");
-
-        // A shorter screen puts them somewhere else, so the region is placed
-        // again even though it is still two lines.
+        // A shorter screen puts those lines somewhere else, and the cursor ends
+        // on the last line of the region as it now is. The screen shrinking under
+        // a display that put the cursor back where the log had left it is how the
+        // cursor came to be stranded below the bottom margin, with every record
+        // after it rewriting the same row and no resize able to help: the frame
+        // that followed saved that row and restored it again.
         state.terminal_rows = 12;
         let mut frame = Buffer::no_color();
         paint_progress(&mut state, &mut frame).expect("paint a frame");
@@ -3525,6 +3506,9 @@ mod tests {
         assert_eq!((state.reserved, state.region_rows), (2, 12));
         assert!(painted.contains("\x1b[1;10r"), "{painted:?}");
         assert!(painted.contains("\x1b[11;1H\x1b[2K"), "{painted:?}");
+        // Twelve rows less the two held, so the log carries on from inside the
+        // margins rather than below them.
+        assert!(painted.ends_with("\x1b[10;1H"), "{painted:?}");
     }
 
     #[test]
