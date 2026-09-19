@@ -1424,6 +1424,7 @@ impl Reviewer {
                                             .map(|s| s.to_string());
                                         let preexisting = f["preexisting"].as_bool();
                                         let locations = f.get("locations").cloned();
+                                        let stages = f.get("stages").cloned();
 
                                         ctx.db
                                             .create_finding(Finding {
@@ -1432,6 +1433,7 @@ impl Reviewer {
                                                 severity_explanation,
                                                 problem,
                                                 preexisting,
+                                                stages,
                                                 locations,
                                             })
                                             .await?;
