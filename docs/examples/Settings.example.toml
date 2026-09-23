@@ -11,3 +11,9 @@ explicit_prompt_caching = false
 # Reviews run concurrently up to this many patches. Sized for one developer's
 # machine; the daemon's own Settings.toml uses a much larger fan-out.
 concurrency = 4
+
+# Name the stages that raised each finding in review output, so a severity tag
+# reads "[Severity: Low] (Resource Mgmt)". Off by default. The stages are
+# recorded in the findings table either way, so this only decides whether a
+# reader is shown them.
+# stage_provenance = false

@@ -857,6 +857,15 @@ pub struct ReviewSettings {
     /// Conservative default; set to 0 to disable.
     #[serde(default = "default_max_total_output_tokens")]
     pub max_total_output_tokens: usize,
+    /// Whether review output names the stages behind each finding, as
+    /// `[Severity: Low] (Resource Mgmt)`.
+    ///
+    /// Off by default, which is how a review read before this setting existed.
+    /// A review records the stages either way: the findings table keeps them
+    /// whatever this says, so turning it on later describes findings already
+    /// stored, and turning it off loses nothing.
+    #[serde(default)]
+    pub stage_provenance: bool,
     #[serde(skip)]
     pub stages: Option<Vec<String>>,
 }
@@ -1311,6 +1320,35 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// Naming stages is off unless a deployment asks for it.
+    ///
+    /// One shape reads [review], so there is one answer to read: a switch only
+    /// half the readers saw would have named stages in one command's output and
+    /// not the other's.
+    #[test]
+    fn test_stage_provenance_is_off_until_asked_for() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Settings.toml");
+        let file = |review: &str| {
+            format!(
+                "[ai]\nprovider = \"gemini\"\nmodel = \"gemini-3-pro\"\n\
+                 \n[review]\nconcurrency = 8\n{review}"
+            )
+        };
+
+        std::fs::write(&path, file("")).unwrap();
+        assert!(
+            !Settings::load(Some(&path)).unwrap().review.stage_provenance,
+            "off unless the file asks for it"
+        );
+
+        std::fs::write(&path, file("stage_provenance = true\n")).unwrap();
+        assert!(
+            Settings::load(Some(&path)).unwrap().review.stage_provenance,
+            "and on where it does"
+        );
     }
 
     /// The daemon cannot run on a file a local review is happy with, and says so

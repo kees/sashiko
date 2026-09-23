@@ -278,6 +278,7 @@ pass.
 | `email_policy_path` | string | `"email_policy.toml"` | Path to the email policy file. |
 | `max_total_tokens` | integer | `5000000` | Maximum cumulative uncached tokens (input + output) per review. Cached tokens are excluded. Set to 0 to disable. |
 | `max_total_output_tokens` | integer | `500000` | Maximum cumulative output tokens per review. Set to 0 to disable. |
+| `stage_provenance` | boolean | `false` | Name the stages that raised each finding in review output, as `[Severity: Low] (Resource Mgmt)`. The stages are recorded in the findings table either way, so this only decides whether a reader is shown them. |
 
 ### `[linux_bug]`
 
