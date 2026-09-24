@@ -1,0 +1,212 @@
+[
+    {
+        "Commit": "d4c81bbb8600257fd3076d0196cb08bd2e5bdf24",
+        "Fixed-by": "c5d5ecf21fdd9ce91e6116feb3aa83cee73352cc",
+        "subsystem": "selftests",
+        "problem_description": "the mptcp_join.sh selftest incorrectly expects 2 MP_JOIN ACKs instead of 3 on older kernels"
+    },
+    {
+        "Commit": "5c338112e48ab1937f99e4a8990a82c999fda126",
+        "Fixed-by": "0a98de80136968bab7db37b16282b37f044694d3",
+        "subsystem": "vsock",
+        "problem_description": "The seqpacket message bounds test hangs because the sender fills the TX buffer before waking up the receiver."
+    },
+    {
+        "Commit": "c08e8baea78e472383d6b295bb8db2132068c358",
+        "Fixed-by": "04708606fd7bdc34b69089a4ff848ff36d7088f9",
+        "subsystem": "selftests",
+        "problem_description": "AMT tests fail because packets are sent before the tunnel connection is established or the listener socket is ready."
+    },
+    {
+        "Commit": "3070c05b7afdf3da2d88d255a421fffca86f1f63",
+        "Fixed-by": "5d54aa40c7b7e9dee5746cca99e9ddbcca13e895",
+        "subsystem": "vsock",
+        "problem_description": "The test suite fails to detect available vsock transports because it strictly filters for symbols of type 'd' in /proc/kallsyms."
+    },
+    {
+        "Commit": "c0087d807ae86cc82cc356e366d2dccf0e3bb225",
+        "Fixed-by": "d045e166d3c51b7aec069669bb243e057d80d04f",
+        "subsystem": "selftests",
+        "problem_description": "The s390 vDSO selftest fails to compile because the include path refers to the old `vdso64` directory instead of the renamed `vdso` directory."
+    },
+    {
+        "Commit": "4ed591c8ab44e711e56b8e021ffaf4f407c045f5",
+        "Fixed-by": "4f5f148dd7c0459229d2ab9a769b2e820f9ee6a2",
+        "subsystem": "selftests",
+        "problem_description": "The fib-onlink-tests fail if the system under test already has a default IPv6 route configured."
+    },
+    {
+        "Commit": "66bce7afbaca6ca9022210b0cd9fa3405da36667",
+        "Fixed-by": "21c68ad1d9771d331198cc73cbf6e908d7915f35",
+        "subsystem": "mm",
+        "problem_description": "The gup_longterm selftest fails on unknown filesystems because it returns early without reporting the test result."
+    },
+    {
+        "Commit": "879bca0a2c4f40b08d09a95a2a0c3c6513060b5c",
+        "Fixed-by": "fb39444732f02c32a8312c168d97e33d872c14d3",
+        "subsystem": "mm",
+        "problem_description": "missing selftests for forked faulted/unfaulted VMA merges"
+    },
+    {
+        "Commit": "9cf9aa77a1f6339ac97ac4afe44939cf0974ef96",
+        "Fixed-by": "9d48c62f6b4ed70ebeea70f52ddb1c6d8613bed4",
+        "subsystem": "net",
+        "problem_description": "The toeplitz.py test passes the RPS mask without a '0x' prefix to toeplitz.c, causing it to be parsed as decimal instead of hexadecimal."
+    },
+    {
+        "Commit": "2144833e7b41459fa2d52bb0676f0ab4920cf32c",
+        "Fixed-by": "6a0243c4020636482797acfd48d7d9b0ea2f2a20",
+        "subsystem": "ALSA",
+        "problem_description": "The KUnit test suite for the Cirrus side-codec library was incorrectly named 'snd-hda-scodec-cs35l56-test' instead of 'snd-hda-cirrus-scodec-test'."
+    },
+    {
+        "Commit": "2144833e7b41459fa2d52bb0676f0ab4920cf32c",
+        "Fixed-by": "c5e96e54eca3876d4ce8857e2e22adbe9f44f4a2",
+        "subsystem": "ALSA",
+        "problem_description": "The cirrus_scodec_test KUnit test fails to associate the software node with the GPIO driver because the mock gpio_chip does not have its parent device set."
+    },
+    {
+        "Commit": "2f65b44e199c6521be8dbc7458250c74a86ce2aa",
+        "Fixed-by": "c39a6a277e0e67ffff6a8efcbbf7e7e23ce9e38c",
+        "subsystem": "vsock",
+        "problem_description": "If the last test fails, the other side still completes correctly, leading to false positive results."
+    },
+    {
+        "Commit": "e93d5945ed5bb086431e83eed7ab98b6c058cc0b",
+        "Fixed-by": "7adfd682745a41fdf0279e4457d11fffab145a8f",
+        "subsystem": "iommufd",
+        "problem_description": "Link failures occur when IOMMU_PT_AMDV1 is configured as a module while IOMMUFD is built-in, causing undefined references in the selftest."
+    },
+    {
+        "Commit": "d2041f1f11dd99076010841a86c4d02d04650814",
+        "Fixed-by": "faa37ff3bf18d5242fe3d54f5462b1c3254c2567",
+        "subsystem": "iommufd",
+        "problem_description": "The iommufd selftest fails to build due to missing DMA_SHARED_BUFFER Kconfig selection."
+    },
+    {
+        "Commit": "01569c216ddeda94d3d8ffb8a5241ba3b2d72a5a",
+        "Fixed-by": "cefd81e76a8c0dc4aa2bacd884acca44e7b61e5b",
+        "subsystem": "iommu",
+        "problem_description": "kunit tests fail to build because GENERIC_PT is unselectable without COMPILE_TEST enabled"
+    },
+    {
+        "Commit": "37f46601383aa5a19bd42ea99617fa0fa6215f77",
+        "Fixed-by": "6e39903c73df08b256322d04c4dfe4a82ec63a45",
+        "subsystem": "selftests/tracing",
+        "problem_description": "The test_multiple_writes test stalls when the tracing buffer size is less than 12KB due to insufficient buffer space."
+    },
+    {
+        "Commit": "f83d51a5bdfe5ab56c27fd5dfe01c613b37e2dad",
+        "Fixed-by": "15e8d739fda1084d81f7d3813e9600eba6e0f134",
+        "subsystem": "selftests/landlock",
+        "problem_description": "The server file descriptor srv_fd is leaked in the named_unix_domain_socket_ioctl test."
+    },
+    {
+        "Commit": "15c64c47e48472875c2b85838581843f05057787",
+        "Fixed-by": "0f42c2a52d8a7535088895c3104150ac9019afd8",
+        "subsystem": "crypto",
+        "problem_description": "A syntax error in scripts/crypto/gen-hash-testvecs.py causes build failures with older Python versions due to improper quoting in an f-string."
+    },
+    {
+        "Commit": "b3aed551b3fca753469520c95b6f4c61ada028d3",
+        "Fixed-by": "fcff71fd888dce1533a3975e68fc80824ff69ef9",
+        "subsystem": "crypto",
+        "problem_description": "The KUnit test test_polyval_preparekey_in_irqs fails on fast machines because the iteration count is too low to guarantee IRQ execution."
+    },
+    {
+        "Commit": "308b7dee3e5c767e88bbecceff3883c8b17c55b6",
+        "Fixed-by": "790792ebc9603a7ccbf6996cb537d89607e3a75b",
+        "subsystem": "tools",
+        "problem_description": "the main install target incorrectly installs test artifacts"
+    },
+    {
+        "Commit": "68a052239fc4b351e961f698b824f7654a346091",
+        "Fixed-by": "353cfc0ef3f34ef7fe313ae38dac37f2454a7cf5",
+        "subsystem": "selftests",
+        "problem_description": "The 'tool' module is missing from the net selftests library imports, causing ImportErrors in tests."
+    },
+    {
+        "Commit": "ab844cf32058d6ba9bd98a921afa2256085e21fc",
+        "Fixed-by": "946c5efe6a059f7d3303442644ee38384453ff68",
+        "subsystem": "rust",
+        "problem_description": "The doctest line number anchor was not updated when adding an `#![allow]` attribute, resulting in off-by-one line numbers in KUnit test output."
+    },
+    {
+        "Commit": "d87b29179aa00efe15c88eebbcb88819e87e7f2a",
+        "Fixed-by": "b889b4fb4cbea3ca7eb9814075d6a51936394bd9",
+        "subsystem": "selftests/ftrace",
+        "problem_description": "The func_traceonoff_triggers test fails because the md5sum check is sensitive to non-deterministic task name resolution updates in the trace output even when tracing is paused."
+    },
+    {
+        "Commit": "fefcf0f7cf470845b3675286c298484a056a7b13",
+        "Fixed-by": "7aa593d8fb64b884bf00c13e01387b0733f3d786",
+        "subsystem": "selftests/landlock",
+        "problem_description": "Missing semicolon after EXPECT_EQ statement in the scoped_vs_unscoped test."
+    },
+    {
+        "Commit": "7678523109d1d9ee58adfe1cadbcd8fe195164ae",
+        "Fixed-by": "fe072f651083c612278de82ce08bccdfecf574b3",
+        "subsystem": "tools/build",
+        "problem_description": "The `test-all` feature test always fails to link because the `-lssl` flag is missing."
+    },
+    {
+        "Commit": "f83d51a5bdfe5ab56c27fd5dfe01c613b37e2dad",
+        "Fixed-by": "e1a57c33590a50a6639798e60a597af4a23b0340",
+        "subsystem": "selftests/landlock",
+        "problem_description": "The named_unix_domain_socket_ioctl test calls bind() with an uninitialized sun_path, causing random test failures due to reading stack garbage."
+    },
+    {
+        "Commit": "a549d055a22e4fc5559ef642b30721899fa07b75",
+        "Fixed-by": "bd09d9a05cf04028f639e209b416bacaeffd4909",
+        "subsystem": "landlock",
+        "problem_description": "The bind(AF_UNSPEC) test incorrectly expects -EINVAL instead of -EAFNOSUPPORT on IPv6 sockets and uses an insufficient address length."
+    },
+    {
+        "Commit": "f60b6634cd88a749fdcd9edfeb2079c23aa05b66",
+        "Fixed-by": "632b874d59a36caf829ab5790dafb90f9b350fd6",
+        "subsystem": "mm",
+        "problem_description": "The uffd-unit-tests selftest fails on 32-bit architectures because it uses sizeof on a pointer instead of strlen to calculate a string offset."
+    },
+    {
+        "Commit": "75e961730b9e8506aa9b5cb670bdd674ce80e46a",
+        "Fixed-by": "9e724085dacdeec60642e25b1b89245e14f48ef9",
+        "subsystem": "perf",
+        "problem_description": "The basic perf top coverage test is flaky and fails to capture samples when running in parallel with other tests due to system load."
+    },
+    {
+        "Commit": "2e64fe4624d19bc71212aae434c54874e5c49c5a",
+        "Fixed-by": "472c5dd6b95c02b3e5d7395acf542150e91165e7",
+        "subsystem": "selftests/net",
+        "problem_description": "The test fails with a false positive buffer overflow error when compiled with _FORTIFY_SOURCE=3, and the IFLA_IFNAME attribute was incorrectly sent without null termination."
+    },
+    {
+        "Commit": "81236c74dba6f4966d76c471ef4434846c2fc05c",
+        "Fixed-by": "f0e5126f5e55d4939784ff61b0b7e9f9636d787d",
+        "subsystem": "selftests",
+        "problem_description": "The test case name is not visible to ksft_run because it is assigned inside the test function execution rather than during its creation."
+    },
+    {
+        "Commit": "8f90dc6e417a64144d06405ee0404965139c825a",
+        "Fixed-by": "d52668cac3f98f86aa1fb238dec1320c80fbefea",
+        "subsystem": "selftests",
+        "problem_description": "Templated test names in psp_ip_ver_test_builder are not visible to the test runner because the test_case.__name__ assignment occurs during test execution rather than at construction time."
+    },
+    {
+        "Commit": "950a81224e8bda92813c5ecf851f488c94f06aba",
+        "Fixed-by": "c31f4aa8fed048fa70e742c4bb49bb48dc489ab3",
+        "subsystem": "kunit",
+        "problem_description": "KUnit interrupt tests may fail if the main task finishes before interrupts execute, execution counters lack atomicity, and assertion messages are overly specific."
+    },
+    {
+        "Commit": "eb972eab0794dedeef5b3b1845e5f9a78793f184",
+        "Fixed-by": "f4ea8e05f2a857d5447c25f7daf00807d38b307d",
+        "subsystem": "lkdtm",
+        "problem_description": "Empty busy wait loops in hardirq test functions cause objtool warnings regarding unexpected section ends when building with Clang on x86_64."
+    },
+    {
+        "Commit": "b753522bed0b7e388a643f58d91bd81d8849ba43",
+        "Fixed-by": "a26ec8f3d4e56d4a7ffa301e8032dca9df0bbc05",
+        "subsystem": "kho",
+        "problem_description": "The KHO test module accesses uninitialized internal data structures because it fails to check if KHO is enabled before issuing commands."
+    }
+]
