@@ -1920,6 +1920,7 @@ impl Reviewer {
                                             continue;
                                         }
                                         let locations = f.get("locations").cloned();
+                                        let stages = f.get("stages").cloned();
 
                                         ctx.db
                                             .create_finding(Finding {
@@ -1928,6 +1929,7 @@ impl Reviewer {
                                                 severity_explanation,
                                                 problem,
                                                 preexisting,
+                                                stages,
                                                 locations,
                                             })
                                             .await?;

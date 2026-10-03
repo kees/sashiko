@@ -15,9 +15,20 @@ Migrations live in `src/migrations/NNN_name.sql` and are applied sequentially in
   *must* open a transaction (`let tx = self.begin_transaction().await?`), run
   `tx.execute_batch(...)`, update `tx.execute("PRAGMA user_version = N", ())`,
   and commit atomically.
+- **Read Inside the Transaction**: A step that asks about the schema before
+  changing it (`pragma_table_info`, `sqlite_master`) must ask on `tx` rather than
+  `self.conn`, so the answer cannot go stale before it is used.
+  `begin_transaction` opens an `Immediate` transaction, so a second migrator
+  waits for the first to finish instead of reading alongside it.
+- **Re-application Safety**: Every migration added from here on must survive
+  running twice. `test_migration_retires_folded_bugs_left_in_the_pipeline`
+  rewinds `PRAGMA user_version` to 3 and applies the ladder again, so any step
+  you write runs a second time against a schema it has already changed.
 - **Defect to Catch**:
   - Executing migration DDL outside a transaction (leaving a half-applied schema
     if a statement fails while `user_version` remains `N-1`).
+  - An `ALTER TABLE` step with no existence check, or a check performed before
+    the transaction opens rather than inside it.
   - Editing an already-shipped migration file (`001`..`005`) instead of adding
     a new numbered migration (`006_...`). Existing databases with `user_version >= N`
     will never re-run modified SQL in migration `N`.
