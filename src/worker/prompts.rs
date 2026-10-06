@@ -107,6 +107,8 @@ pub struct WorkerConfig {
 
 #[derive(Debug, Clone)]
 pub enum WorkerProgressEvent {
+    PrefetchStarted,
+    PrefetchFinished,
     PreScreenStarted,
     PlanningStarted,
     ReviewStarted {
@@ -309,25 +311,6 @@ impl Worker {
             }
         }
 
-        let worktree_path = self.tools.get_worktree_path();
-        let (prefetched_context, prefetch_failed) = match crate::worker::prefetch::prefetch_context(
-            worktree_path,
-            &target_commit_sha,
-            &target_commit_diff,
-        )
-        .await
-        {
-            Ok(context) => (context, false),
-            Err(error) => {
-                tracing::warn!(
-                    target_commit = %target_commit_sha,
-                    %error,
-                    "Source prefetch failed; review must retrieve context with Git tools"
-                );
-                (String::new(), true)
-            }
-        };
-
         let follow_up_series_context = match self.project {
             ProjectId::Linux => build_follow_up_series_context(
                 self.series_range.as_deref(),
@@ -348,11 +331,13 @@ impl Worker {
             baseline_sha,
             target_commit_diff,
             target_commit_diff_only,
-            prefetched_context,
-            prefetch_failed,
+            // Filled in by the prefetch stage, which runs beside the pre-screen.
+            prefetched_context: String::new(),
+            prefetch_failed: false,
             series_range: self.series_range.clone(),
             follow_up_series_context,
             selected_guides: Vec::new(),
+            stage_selected_guides: Vec::new(),
             manual_stages: self.stages.clone(),
             custom_prompt: self.custom_prompt.clone(),
             planned_stages: Vec::new(),
@@ -411,7 +396,9 @@ impl Worker {
             if let Some(progress_cb) = progress {
                 match event {
                     WorkflowEvent::StageStarted { stage_name } => {
-                        if stage_name == "pre-screen" {
+                        if stage_name == "prefetch" {
+                            progress_cb(WorkerProgressEvent::PrefetchStarted);
+                        } else if stage_name == "pre-screen" {
                             progress_cb(WorkerProgressEvent::PreScreenStarted);
                         } else if stage_name == "planning" {
                             progress_cb(WorkerProgressEvent::PlanningStarted);
@@ -457,7 +444,9 @@ impl Worker {
                         }
                     }
                     WorkflowEvent::StageFinished { stage_name, .. } => {
-                        if crate::workflows::is_counted_stage(project, stage_name) {
+                        if stage_name == "prefetch" {
+                            progress_cb(WorkerProgressEvent::PrefetchFinished);
+                        } else if crate::workflows::is_counted_stage(project, stage_name) {
                             progress_cb(WorkerProgressEvent::StageFinished {
                                 stage: stage_name.to_string(),
                             });

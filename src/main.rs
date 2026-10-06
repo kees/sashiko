@@ -1530,11 +1530,14 @@ struct PatchState {
     completed_stages: usize,
     active_stage_turns: std::collections::HashMap<String, usize>,
     /// Stages that ran before the fan-out resolved, and so are not in
-    /// `planned_stages`: the pre-screen and the planner.
+    /// `planned_stages`: the source prefetch, the pre-screen, and the planner.
     ///
-    /// Counted as they start rather than predicted, because whether either runs
+    /// Counted as they start rather than predicted, because whether one runs
     /// depends on `--stages`. A stage that has started is one that ran.
     preliminary_stages: usize,
+    /// Whether the source prefetch is still running, which it can be while a
+    /// model call runs beside it.
+    prefetching: bool,
 }
 
 /// The window size of the terminal behind `stream`, in rows and columns, or
@@ -1879,7 +1882,21 @@ fn on_stderr(
 /// Describes what a patch is doing. `with_turns` adds the turn counter, which
 /// changes on every model call and so is only of use to a display that draws
 /// over what it said last.
+///
+/// The prefetch runs beside the stage that follows it rather than before it, so
+/// it is said alongside whatever else the patch is doing: on its own while that
+/// is all there is, and as a trailer once a model call has started.
 fn status_label(project: ProjectId, p: &PatchState, with_turns: bool) -> String {
+    let label = model_status_label(project, p, with_turns);
+    match (p.prefetching, p.status == PatchStatus::Queued) {
+        (true, true) => "Prefetching source...".to_string(),
+        (true, false) => format!("{label} (+prefetch)"),
+        (false, _) => label,
+    }
+}
+
+/// The part of the label that is about model work, which the prefetch is not.
+fn model_status_label(project: ProjectId, p: &PatchState, with_turns: bool) -> String {
     match &p.status {
         PatchStatus::Queued => "Queued".to_string(),
         PatchStatus::PreScreening => "Pre-screening guides...".to_string(),
@@ -2215,8 +2232,8 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
 
 /// Stages this patch will have run by the time it is finished.
 ///
-/// The pre-screen and the planner are added as they start, since whether they
-/// run is not knowable in advance. The rest are whatever the fan-out resolved
+/// The prefetch, the pre-screen, and the planner are added as they start, since
+/// whether one runs is not knowable in advance. The rest are whatever the fan-out resolved
 /// to, plus the consolidation stages that always follow; before it resolves,
 /// assume every stage, which is where a review with no `--stages` and a generous
 /// planner ends up anyway.
@@ -2344,6 +2361,7 @@ async fn handle_review_command(
                             completed_stages: 0,
                             active_stage_turns: std::collections::HashMap::new(),
                             preliminary_stages: 0,
+                            prefetching: false,
                         },
                     );
                 }
@@ -2381,6 +2399,23 @@ async fn handle_review_command(
                 // call per patch — is time the display would otherwise spend
                 // blank, with the count it is about to report already settled.
                 render_progress(&mut s);
+            }
+            ProgressEvent::AiReviewPrefetchStarted { patch_index } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    // A flag rather than a status: it runs beside the pre-screen,
+                    // so the patch can be doing both and the status says which
+                    // model call is in flight.
+                    p.prefetching = true;
+                    p.preliminary_stages += 1;
+                    render_progress(&mut s);
+                }
+            }
+            ProgressEvent::AiReviewPrefetchFinished { patch_index } => {
+                if let Some(p) = s.patches.get_mut(&patch_index) {
+                    p.prefetching = false;
+                    p.completed_stages += 1;
+                    render_progress(&mut s);
+                }
             }
             ProgressEvent::AiReviewPreScreenStarted { patch_index } => {
                 if let Some(p) = s.patches.get_mut(&patch_index) {
@@ -3882,6 +3917,7 @@ mod tests {
             completed_stages: 0,
             active_stage_turns: std::collections::HashMap::new(),
             preliminary_stages: 0,
+            prefetching: false,
         }
     }
 
@@ -4510,6 +4546,37 @@ mod tests {
     }
 
     #[test]
+    fn test_the_prefetch_is_said_beside_whatever_else_a_patch_is_doing() {
+        // Queued is for a patch nothing has started on, so a prefetch on its own
+        // says that much instead.
+        let mut p = patch_state(PatchStatus::Queued);
+        p.prefetching = true;
+        assert_eq!(
+            status_label(ProjectId::Linux, &p, true),
+            "Prefetching source..."
+        );
+
+        // And once a model call is in flight beside it, the call leads and the
+        // prefetch trails: both are true, and the reader is waiting on both.
+        p.status = PatchStatus::PreScreening;
+        assert_eq!(
+            status_label(ProjectId::Linux, &p, true),
+            "Pre-screening guides... (+prefetch)"
+        );
+
+        // Finished, it says nothing at all.
+        p.prefetching = false;
+        assert_eq!(
+            status_label(ProjectId::Linux, &p, true),
+            "Pre-screening guides..."
+        );
+        assert_eq!(
+            status_label(ProjectId::Linux, &patch_state(PatchStatus::Queued), true),
+            "Queued"
+        );
+    }
+
+    #[test]
     fn test_status_label_drops_the_turn_counter_when_not_repainting() {
         let mut p = patch_state(PatchStatus::Reviewing);
         p.active_stages.insert("locking".to_string());
@@ -4557,13 +4624,18 @@ mod tests {
         };
         let total = |p: &PatchState| patch_stage_total(ProjectId::Linux, p);
 
-        // A full review: the pre-screen and the planner both ran, and the fan-out
-        // has not resolved yet, so assume the rest of them.
-        assert_eq!(total(&planned(&[], 2)), 2 + every);
+        // A full review: the prefetch, the pre-screen, and the planner all ran,
+        // and the fan-out has not resolved yet, so assume the rest of them.
+        assert_eq!(total(&planned(&[], 3)), 3 + every);
 
-        // --stages locking: neither preliminary ran, and the plan is what was
-        // asked for plus the consolidation stages that always follow.
-        assert_eq!(total(&planned(&["locking"], 0)), 1);
+        // --stages locking: the prefetch runs whatever was asked for, the
+        // pre-screen and the planner do not, and the plan is what was asked for
+        // plus the consolidation stages that always follow.
+        assert_eq!(total(&planned(&["locking"], 1)), 2);
+
+        // --stages pre-screen,locking: the pre-screen joins the prefetch, and
+        // the planner is still skipped.
+        assert_eq!(total(&planned(&["locking"], 2)), 3);
 
         // A patch that left by an early exit ran fewer stages than it planned,
         // and the ones it skipped must leave the total rather than strand the bar

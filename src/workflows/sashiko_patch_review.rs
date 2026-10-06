@@ -357,6 +357,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: true,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "implementation",
@@ -366,6 +367,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: true,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "execution-flow",
@@ -375,6 +377,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "concurrency",
@@ -384,6 +387,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "persistence",
@@ -393,6 +397,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "llm-pipeline",
@@ -406,6 +411,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "security",
@@ -420,6 +426,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "interfaces-compat",
@@ -429,6 +436,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "tests",
@@ -438,6 +446,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: true,
+        prescreen_guides: &[],
     },
 ];
 
@@ -1216,7 +1225,15 @@ pub fn build_sashiko_patch_review_workflow_with_options(
     stage_provenance: bool,
 ) -> Workflow<SashikoPatchReviewState> {
     Workflow::builder("sashiko_patch_review")
-        .stage(prescreen_stage())
+        // As in the kernel workflow: the pre-screen reads none of what the
+        // prefetch gathers, so they share a step.
+        .parallel(
+            vec![
+                Box::new(prescreen_stage()),
+                Box::new(crate::workflows::linux_patch_review::SourcePrefetchStage),
+            ],
+            ParallelPolicy::FailFast,
+        )
         .dynamic_parallel(
             planning_stage(),
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),

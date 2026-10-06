@@ -22,11 +22,12 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::workflow::events::WorkflowEvent;
 use crate::workflow::graph::Workflow;
 use crate::workflow::output::OutputFormat;
 use crate::workflow::policy::{ParallelPolicy, RecitationPolicy, StagePolicy, ToolScope};
 use crate::workflow::prompt::PromptTemplate;
-use crate::workflow::stage::{ExecutableStage, Stage};
+use crate::workflow::stage::{ExecutableStage, Stage, StageOutcome, StateMutation, WorkflowEnv};
 
 /// Complete execution state of a Linux kernel patch review.
 #[derive(Clone, Debug, Default)]
@@ -46,6 +47,9 @@ pub struct LinuxPatchReviewState {
     /// Subsystem guide markdown files selected during the pre-screen and
     /// shared with every stage.
     pub selected_guides: Vec<String>,
+    /// Guides the pre-screen selected that a stage claims for itself. Held
+    /// apart from `selected_guides` so they reach that stage and no other.
+    pub stage_selected_guides: Vec<String>,
     /// Optional manual stages filter (e.g. `--stages goal,locking`).
     pub manual_stages: Option<Vec<String>>,
     /// Caller-supplied instructions appended to the shared system prompt.
@@ -228,6 +232,16 @@ You are a Red Team security researcher auditing a Linux kernel patch. Look for s
 const STAGE_HARDWARE_INSTRUCTION: &str = r#"# Hardware engineer's review
 
 You are a hardware engineer reviewing device driver changes. If this patch touches driver or hardware-specific code, rigorously review register accesses, IRQ handling, DMA mapping/unmapping, memory barriers, and timing/delays. Look for missing dma_wmb()/dma_rmb() barriers, incorrect endianness conversions (cpu_to_le32), and unsafe DMA buffer allocations. Ensure the hardware state machine is handled correctly, especially during suspend/resume or device reset. Evaluate the physical state machine constraints: verify that clocks and power domains are enabled before registers are accessed, and that hardware rings/queues are actually initialized in the current hardware state before being unconditionally accessed. If the patch is purely generic software logic (e.g., VFS, core networking), return {"concerns": [], "dismissed_concerns": []}."#;
+
+const STAGE_TESTABILITY_INSTRUCTION: &str = r#"# Testability and test review
+
+You are a test engineer reviewing a proposed change for testability and for the quality of any tests it brings with it. Two questions, in order.
+
+First, is the claim in the commit message checkable? A change that fixes a bug, alters observable behaviour, or adds an interface should normally come with something that would fail before it and pass after. If the change has no tests, decide whether it plausibly could have: a pure refactor, a comment fix, or a hardware-specific path with no available model may reasonably have none, but a logic fix with a described reproducer usually should. Raise a concern only where a test is both practical and genuinely valuable; absent tests are a routine and accepted state for much of this codebase, so do not raise this on every patch.
+
+Second, if the change does add or modify tests, review them as rigorously as you would review any other code. Would the test actually fail if the behaviour it describes regressed, or does it assert something trivially true? Does it test observable behaviour rather than the shape of the current implementation? Does it clean up what it allocates, skip rather than fail when its prerequisites are unavailable, and avoid depending on timing, host configuration, or the order in which tests run? Check that a test claiming to cover the commit's fix actually exercises the changed code path. A test that passes whether or not the bug is present is worse than no test, because it advertises coverage that does not exist.
+
+Follow the project's own testing conventions where the guidance below describes them; a test that ignores the framework's idioms is a maintenance problem even when it works. If the patch touches no code and adds no tests, return {"concerns": [], "dismissed_concerns": []}."#;
 
 const STAGE_VERIFICATION_INSTRUCTION: &str = r#"# Verification and severity estimation
 
@@ -1146,8 +1160,87 @@ pub fn enrich_post_verification_output(
 // Stage Definitions
 // ---------------------------------------------------------------------------
 
+/// Reads the source the patch touches, and the definitions it refers to, out of
+/// the target commit.
+///
+/// A stage rather than a step taken before the workflow, so it can share a
+/// parallel step with the pre-screen: it is the longest thing a review does
+/// before its first model call, and nothing reads what it gathers until the
+/// stage after that step. Whatever runs there — the planner, or an analysis
+/// stage where `--stages` skipped the planner — reads it from state that the
+/// step has already settled, so the dependency holds however the review was
+/// asked for.
+///
+/// Takes no permits and no turns, and reports both as zero, which keeps it out
+/// of the token accounting while leaving it a stage the display can name.
+pub struct SourcePrefetchStage;
+
+#[async_trait::async_trait]
+impl ExecutableStage<LinuxPatchReviewState> for SourcePrefetchStage {
+    fn name(&self) -> &'static str {
+        PREFETCH_STAGE
+    }
+
+    async fn execute_isolated(
+        &self,
+        env: &WorkflowEnv<'_>,
+        state: &LinuxPatchReviewState,
+        event_cb: Option<&(dyn Fn(WorkflowEvent) + Send + Sync)>,
+    ) -> Result<(StageOutcome, StateMutation<LinuxPatchReviewState>), anyhow::Error> {
+        if let Some(cb) = event_cb {
+            cb(WorkflowEvent::StageStarted {
+                stage_name: self.name(),
+            });
+        }
+
+        // Failure is reported to the review rather than to the engine. The
+        // prompt tells the model to gather the source with the git tools when
+        // this is set, which is what it did before this was a stage, and an
+        // error here would take down the stage beside it under FailFast.
+        let (prefetched_context, prefetch_failed) = match crate::worker::prefetch::prefetch_context(
+            env.tools.get_worktree_path(),
+            &state.target_commit_sha,
+            &state.target_commit_diff,
+        )
+        .await
+        {
+            Ok(context) => (context, false),
+            Err(error) => {
+                tracing::warn!(
+                    target_commit = %state.target_commit_sha,
+                    %error,
+                    "Source prefetch failed; review must retrieve context with Git tools"
+                );
+                (String::new(), true)
+            }
+        };
+
+        if let Some(cb) = event_cb {
+            cb(WorkflowEvent::StageFinished {
+                stage_name: self.name(),
+                tokens_in: 0,
+                tokens_out: 0,
+                tokens_cached: 0,
+            });
+        }
+
+        Ok((
+            StageOutcome {
+                tokens_in: 0,
+                tokens_out: 0,
+                tokens_cached: 0,
+                history: Vec::new(),
+            },
+            Box::new(move |s: &mut LinuxPatchReviewState| {
+                s.prefetched_context = prefetched_context;
+                s.prefetch_failed = prefetch_failed;
+            }),
+        ))
+    }
+}
+
 pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
-    Stage::builder("pre-screen")
+    Stage::builder(PRESCREEN_STAGE)
         .system_prompt(PromptTemplate::<LinuxPatchReviewState>::new(
             "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```",
         ))
@@ -1173,15 +1266,15 @@ pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
             max_turns: 1,
             ..Default::default()
         })
-        .skip_if(|s| s.manual_stages.is_some())
+        .skip_if(prescreen_skipped)
         .reduce(|state, out: PrescreenOutput| {
-            let prompts: Vec<String> = out
+            let (claimed, shared): (Vec<String>, Vec<String>) = out
                 .selected_prompts
                 .into_iter()
-                .filter(|name| !is_stage_exclusive_guide(name))
                 .filter(|name| crate::workflows::guard::sanitize_guide_name(name))
-                .collect();
-            state.selected_guides = prompts;
+                .partition(|name| is_stage_exclusive_guide(name));
+            state.selected_guides = shared;
+            state.stage_selected_guides = claimed;
         })
 
         .build()
@@ -1194,7 +1287,7 @@ pub fn planning_stage() -> Stage<LinuxPatchReviewState, PlanningOutput> {
         .map(|d| d.name)
         .collect();
 
-    Stage::builder("planning")
+    Stage::builder(PLANNING_STAGE)
         .system_prompt(linux_system_prompt(true))
         .user_prompt(PromptTemplate::<LinuxPatchReviewState>::new(
             r#"Analyze the provided patch and determine which of the following review stages are relevant and should be executed:
@@ -1278,6 +1371,11 @@ pub struct AnalysisStage {
     /// Whether the prompt carries the list of patches that follow this one in
     /// the series. See [`SERIES_CONTEXT_PLACEHOLDER`].
     pub wants_series_context: bool,
+    /// Guides this stage loads only when the pre-screen selected them, by file
+    /// name as the index lists them. For guidance that applies to some patches
+    /// and not others, where `guides` applies to all of them. Like `guides`,
+    /// these are never broadcast to the other stages.
+    pub prescreen_guides: &'static [&'static str],
 }
 
 pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
@@ -1289,6 +1387,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "implementation",
@@ -1298,6 +1397,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: false,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "execution-flow",
@@ -1307,6 +1407,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: false,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "resources",
@@ -1316,6 +1417,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "locking",
@@ -1325,6 +1427,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
     AnalysisStage {
         name: "security",
@@ -1334,6 +1437,23 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: false,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
+    },
+    AnalysisStage {
+        name: "testability",
+        short: "Testability",
+        instruction: STAGE_TESTABILITY_INSTRUCTION,
+        guides: &["subsystem/testing.md"],
+        // Applies only to patches that use these frameworks, so it is left to
+        // the pre-screen to say which patches those are.
+        prescreen_guides: &["kunit.md", "selftests.md"],
+        // Whether a change should have carried a test is a question about what
+        // it claims to do, so this stage needs the commit message.
+        uses_commit_log: true,
+        // A change that should have had a test and does not is the case with
+        // nothing in the diff to match on, so the planner is not asked.
+        optional: false,
+        wants_series_context: true,
     },
     AnalysisStage {
         name: "hardware",
@@ -1343,6 +1463,7 @@ pub static ANALYSIS_STAGES: &[AnalysisStage] = &[
         uses_commit_log: true,
         optional: true,
         wants_series_context: false,
+        prescreen_guides: &[],
     },
 ];
 
@@ -1463,7 +1584,7 @@ pub fn stage_short_label(name: &str) -> Option<&'static str> {
 pub fn is_stage_exclusive_guide(name: &str) -> bool {
     ANALYSIS_STAGES
         .iter()
-        .flat_map(|def| def.guides)
+        .flat_map(|def| def.guides.iter().chain(def.prescreen_guides))
         .any(|guide| guide.rsplit('/').next() == Some(name))
 }
 
@@ -1472,13 +1593,42 @@ pub fn analysis_stage_by_name(name: &str) -> Option<&'static AnalysisStage> {
     ANALYSIS_STAGES.iter().find(|s| s.name == normalized)
 }
 
+/// Nameable in `--stages`, though it is not an analysis stage: asking for it
+/// restores the guide selection that naming stages otherwise skips.
+pub const PRESCREEN_STAGE: &str = "pre-screen";
+/// Not nameable in `--stages`. It chooses which stages run, so naming stages
+/// has already answered it and it is skipped either way.
+pub const PLANNING_STAGE: &str = "planning";
+/// Not nameable in `--stages`. It gathers the source every later stage reads,
+/// so there is no review to run without it.
+pub const PREFETCH_STAGE: &str = "prefetch";
+
 /// Every stage name a review can produce, analysis and consolidation alike,
 /// for validating what a caller or the planner asked for.
 pub fn is_known_stage(name: &str) -> bool {
     let normalized = normalize_stage_name(name);
     analysis_stage_by_name(&normalized).is_some()
         || consolidation_stage_by_name(&normalized).is_some()
-        || matches!(normalized.as_str(), "pre-screen" | "planning")
+        || matches!(
+            normalized.as_str(),
+            PRESCREEN_STAGE | PLANNING_STAGE | PREFETCH_STAGE
+        )
+}
+
+/// Whether naming stages leaves the pre-screen out.
+///
+/// Naming stages skips the pre-screen, because the point is usually to run
+/// one stage without the rest. A caller who wants the guide selection as well
+/// can ask for it by name. Naming nothing runs everything, pre-screen included.
+///
+/// Names are normalized first, so asking for it by any spelling the resolver
+/// would accept keeps it.
+fn prescreen_skipped(state: &LinuxPatchReviewState) -> bool {
+    state.manual_stages.as_ref().is_some_and(|names| {
+        !names
+            .iter()
+            .any(|n| normalize_stage_name(n) == PRESCREEN_STAGE)
+    })
 }
 
 fn analysis_stage(
@@ -1494,6 +1644,16 @@ fn analysis_stage(
     ));
     for guide in def.guides {
         user_template = user_template.include_file(*guide);
+    }
+    if !def.prescreen_guides.is_empty() {
+        let claimed = def.prescreen_guides;
+        user_template = user_template.include_files_from_state(move |s: &LinuxPatchReviewState| {
+            s.stage_selected_guides
+                .iter()
+                .filter(|selected| claimed.contains(&selected.as_str()))
+                .map(|selected| PathBuf::from("subsystem").join(selected))
+                .collect()
+        });
     }
     let user_template = with_series_context(user_template, def.wants_series_context);
 
@@ -1553,7 +1713,30 @@ pub fn resolve_analysis_stages_with_options(
     let mut stages = Vec::new();
     for name in selected_stages {
         match analysis_stage_by_name(&name) {
-            Some(def) => stages.push(analysis_stage(def, max_turns, temperature)),
+            Some(def) => {
+                // Naming stages by hand skips the pre-screen, so a stage whose
+                // guidance depends on what the pre-screen chose runs without
+                // it. Say so, rather than leaving a thinner review to look
+                // like the stage simply had nothing to report.
+                if prescreen_skipped(state) && !def.prescreen_guides.is_empty() {
+                    tracing::warn!(
+                        "Stage {:?} runs without {:?}: naming stages skips the pre-screen that selects them. Add {:?} to --stages to keep it",
+                        def.name,
+                        def.prescreen_guides,
+                        PRESCREEN_STAGE
+                    );
+                }
+                stages.push(analysis_stage(def, max_turns, temperature));
+            }
+            // The pre-screen is selectable but is not an analysis stage; its
+            // own skip condition reads the same list.
+            None if name == PRESCREEN_STAGE => {}
+            // Naming a stage that always runs, or one the caller cannot
+            // choose, is a mistake worth saying out loud.
+            None if is_known_stage(&name) => tracing::warn!(
+                "Stage {:?} is not an analysis stage and cannot be selected",
+                name
+            ),
             // Previously an unrecognised entry was dropped in silence, so a
             // mistyped --stages looked like it had worked.
             None => tracing::warn!("Ignoring unknown review stage {:?}", name),
@@ -1998,7 +2181,14 @@ pub fn build_linux_patch_review_workflow_with_options(
     stage_provenance: bool,
 ) -> Workflow<LinuxPatchReviewState> {
     Workflow::builder("linux_patch_review")
-        .stage(prescreen_stage())
+        // The pre-screen picks guides from the diff and the guide index, so it
+        // wants nothing the prefetch gathers and the two can run together.
+        // FailFast, because a pre-screen that fails failed the review before
+        // this step existed and still should.
+        .parallel(
+            vec![Box::new(prescreen_stage()), Box::new(SourcePrefetchStage)],
+            ParallelPolicy::FailFast,
+        )
         .dynamic_parallel(
             planning_stage(),
             move |state| resolve_analysis_stages_with_options(state, max_turns, temperature),
@@ -2083,13 +2273,69 @@ mod tests {
     }
 
     #[test]
-    fn test_no_analysis_stage_asks_for_series_context_yet() {
-        // Both builders honour the flag; nothing in the analysis table sets it
-        // until a stage needs it. A stage that did would get the placeholder
-        // and the variable together, never one without the other.
-        for def in ANALYSIS_STAGES {
+    fn test_testability_is_the_only_analysis_stage_wanting_series_context() {
+        for def in ANALYSIS_STAGES.iter().filter(|d| d.name != "testability") {
             assert!(!def.wants_series_context, "{} does not use it", def.name);
         }
+    }
+
+    #[test]
+    fn test_a_claimed_guide_is_excluded_from_the_broadcast() {
+        // Synthetic, since no stage claims one yet: whichever way a stage
+        // names a guide, the pre-screen must not also hand it to everyone.
+        let claimed = AnalysisStage {
+            name: "example",
+            short: "Example",
+            instruction: "",
+            guides: &["subsystem/always.md"],
+            uses_commit_log: false,
+            optional: false,
+            wants_series_context: false,
+            prescreen_guides: &["sometimes.md"],
+        };
+        let named = |name: &str| {
+            claimed
+                .guides
+                .iter()
+                .chain(claimed.prescreen_guides)
+                .any(|g| g.rsplit('/').next() == Some(name))
+        };
+        assert!(named("always.md"));
+        assert!(named("sometimes.md"));
+        assert!(!named("elsewhere.md"));
+    }
+
+    #[test]
+    fn test_the_pre_screen_can_be_named_alongside_analysis_stages() {
+        let manual = |names: &[&str]| LinuxPatchReviewState {
+            manual_stages: Some(names.iter().map(|n| n.to_string()).collect()),
+            ..Default::default()
+        };
+
+        // Naming stages skips the pre-screen, which is the usual intent.
+        assert!(prescreen_skipped(&manual(&["locking"])));
+        // Unless it is named too, which is how a caller keeps guide selection.
+        assert!(!prescreen_skipped(&manual(&[PRESCREEN_STAGE, "locking"])));
+        // Nothing named at all: the pre-screen runs, as on any full review.
+        assert!(!prescreen_skipped(&LinuxPatchReviewState::default()));
+    }
+
+    #[test]
+    fn test_naming_the_pre_screen_selects_no_analysis_stage() {
+        // It is a known stage, so it must not be reported as a typo, and it
+        // must not resolve to an analysis stage either.
+        assert!(is_known_stage(PRESCREEN_STAGE));
+        assert!(analysis_stage_by_name(PRESCREEN_STAGE).is_none());
+
+        let state = LinuxPatchReviewState {
+            manual_stages: Some(vec![PRESCREEN_STAGE.to_string(), "locking".to_string()]),
+            ..Default::default()
+        };
+        let names: Vec<&str> = resolve_analysis_stages_with_options(&state, 1, 1.0)
+            .iter()
+            .map(|s| s.name())
+            .collect();
+        assert_eq!(names, ["locking"]);
     }
 
     #[test]
@@ -2134,6 +2380,49 @@ mod tests {
     }
 
     #[test]
+    fn test_testability_runs_for_every_patch() {
+        // The case with nothing in the diff to match on -- a change that
+        // should have had a test and does not -- is the one no other stage
+        // looks at, so the planner is never asked whether to skip it.
+        let def = analysis_stage_by_name("testability").expect("stage exists");
+        assert!(!def.optional);
+        assert!(def.uses_commit_log);
+        assert!(def.wants_series_context);
+    }
+
+    #[test]
+    fn test_testing_guides_are_not_broadcast_to_every_stage() {
+        // Claimed by the testability stage, either always or when the
+        // pre-screen offers them. Left in the shared set they would ride along
+        // in every stage's system prompt, which is why locking.md is excluded
+        // too.
+        for guide in ["testing.md", "kunit.md", "selftests.md"] {
+            assert!(
+                is_stage_exclusive_guide(guide),
+                "{guide} would be broadcast to every stage"
+            );
+        }
+    }
+
+    #[test]
+    fn test_testability_takes_its_framework_guides_from_the_pre_screen() {
+        let def = analysis_stage_by_name("testability").unwrap();
+        assert_eq!(def.prescreen_guides, ["kunit.md", "selftests.md"]);
+        // The general guide applies to every patch, so it is not conditional.
+        assert!(def.guides.contains(&"subsystem/testing.md"));
+        assert!(!def.prescreen_guides.contains(&"testing.md"));
+
+        // It is the only stage taking guides this way.
+        for other in ANALYSIS_STAGES.iter().filter(|d| d.name != "testability") {
+            assert!(
+                other.prescreen_guides.is_empty(),
+                "{} claims some",
+                other.name
+            );
+        }
+    }
+
+    #[test]
     fn test_the_planner_is_only_asked_about_optional_stages() {
         // The prompt lists exactly the optional stages, so a name it returns
         // that is not one of them is a hallucination rather than a choice.
@@ -2149,7 +2438,10 @@ mod tests {
             .filter(|d| !d.optional)
             .map(|d| d.name)
             .collect();
-        assert_eq!(required, ["goal", "implementation", "execution-flow"]);
+        assert_eq!(
+            required,
+            ["goal", "implementation", "execution-flow", "testability"]
+        );
     }
 
     #[test]
@@ -2240,6 +2532,7 @@ mod tests {
                 "goal",
                 "implementation",
                 "execution-flow",
+                "testability",
                 "locking",
                 "resources",
                 "security"
@@ -2723,6 +3016,29 @@ mod tests {
         let workflow = build_linux_patch_review_workflow();
         assert_eq!(workflow.name, "linux_patch_review");
         assert_eq!(workflow.steps.len(), 6);
+    }
+
+    #[test]
+    fn test_the_prefetch_shares_its_step_with_the_pre_screen() {
+        // Together in one step, so the prefetch overlaps a model call rather
+        // than delaying one, and finished before the step that reads what it
+        // gathered: the planner, or an analysis stage where --stages skipped the
+        // planner. A step of its own ahead of them would serialize it again.
+        let workflow = build_linux_patch_review_workflow();
+        let names = match workflow.steps.first().expect("a first step") {
+            crate::workflow::graph::WorkflowStep::Parallel { stages, policy } => {
+                // FailFast: a pre-screen that fails failed the review before it
+                // shared a step, and still has to.
+                assert!(matches!(policy, ParallelPolicy::FailFast), "{policy:?}");
+                stages.iter().map(|s| s.name()).collect::<Vec<_>>()
+            }
+            _ => panic!("the pre-screen and the prefetch must share a parallel step"),
+        };
+        assert!(names.contains(&PRESCREEN_STAGE), "{names:?}");
+        assert!(names.contains(&PREFETCH_STAGE), "{names:?}");
+
+        // And nothing that reads the context runs inside that step.
+        assert!(!names.contains(&PLANNING_STAGE), "{names:?}");
     }
 
     #[test]

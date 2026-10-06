@@ -130,6 +130,12 @@ pub enum ProgressEvent {
     AiReviewStarted {
         patches: usize,
     },
+    AiReviewPrefetchStarted {
+        patch_index: i64,
+    },
+    AiReviewPrefetchFinished {
+        patch_index: i64,
+    },
     AiReviewPreScreenStarted {
         patch_index: i64,
     },
@@ -598,6 +604,16 @@ async fn review_single_patch(
         let p_index = p.index;
         let progress_cb = progress.map(|cb| {
             move |event| match event {
+                crate::worker::WorkerProgressEvent::PrefetchStarted => {
+                    cb(ProgressEvent::AiReviewPrefetchStarted {
+                        patch_index: p_index,
+                    });
+                }
+                crate::worker::WorkerProgressEvent::PrefetchFinished => {
+                    cb(ProgressEvent::AiReviewPrefetchFinished {
+                        patch_index: p_index,
+                    });
+                }
                 crate::worker::WorkerProgressEvent::PreScreenStarted => {
                     cb(ProgressEvent::AiReviewPreScreenStarted {
                         patch_index: p_index,
@@ -1172,6 +1188,12 @@ pub fn progress_line(event: ProgressEvent) -> Option<String> {
             patches,
             if patches == 1 { "" } else { "es" }
         ),
+        ProgressEvent::AiReviewPrefetchStarted { patch_index } => {
+            format!("patch {patch_index}: prefetching source")
+        }
+        ProgressEvent::AiReviewPrefetchFinished { patch_index } => {
+            format!("patch {patch_index}: source prefetched")
+        }
         ProgressEvent::AiReviewPreScreenStarted { patch_index } => {
             format!("patch {patch_index}: pre-screen")
         }
