@@ -1621,6 +1621,12 @@ struct ProgressState {
     /// speaks only when one of them changes.
     last_status: std::collections::BTreeMap<i64, String>,
     total_turns: usize,
+    /// Turns the response cache answered instead of the model, counted apart
+    /// from each other because they mean different things: an entry a previous
+    /// session wrote is work this review skipped, and one this session wrote is
+    /// the same request made twice.
+    cache_hits_prev_session: u64,
+    cache_hits_this_session: u64,
     terminal_width: usize,
     terminal_rows: usize,
     color_choice: ColorChoice,
@@ -2206,8 +2212,12 @@ fn paint_progress(state: &mut ProgressState, out: &mut impl WriteColor) -> std::
         let _ = tw.write_segment(out, "] ", None, true);
 
         let stats = format!(
-            "{}% | {}/{} stages | {} turns",
-            percent, display_completed_stages, total_stages, state.total_turns
+            "{}% | {}/{} stages | {} turns{}",
+            percent,
+            display_completed_stages,
+            total_stages,
+            state.total_turns,
+            cache_hits_suffix(state.cache_hits_prev_session, state.cache_hits_this_session)
         );
         let _ = tw.write_segment(out, &stats, None, false);
     }
@@ -2272,6 +2282,29 @@ fn calculate_progress_metrics(
     (display_completed_stages, percent, filled)
 }
 
+/// What the response cache contributed, as a suffix for the turn count on the
+/// Overall line: `" (7 cached)"`, `" (2 repeated)"`, or `" (7 cached, 2
+/// repeated)"`.
+///
+/// Cached is a turn answered from a previous session's entry, which is work this
+/// review did not repeat. Repeated is a turn answered from one this session
+/// wrote, which is this review asking the same thing twice, mostly a retried
+/// attempt going back over stages it had already done. They are worth telling
+/// apart: the first is the cache doing its job, and the second is the review
+/// doing work over.
+///
+/// Empty where the cache served nothing, which is every review run with the
+/// cache off, so the line reads as it always did rather than carrying a
+/// parenthesis with nothing in it.
+fn cache_hits_suffix(prev_session: u64, this_session: u64) -> String {
+    match (prev_session, this_session) {
+        (0, 0) => String::new(),
+        (cached, 0) => format!(" ({cached} cached)"),
+        (0, repeated) => format!(" ({repeated} repeated)"),
+        (cached, repeated) => format!(" ({cached} cached, {repeated} repeated)"),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_review_command(
     project: ProjectId,
@@ -2333,6 +2366,8 @@ async fn handle_review_command(
         project,
         patches: std::collections::BTreeMap::new(),
         total_turns: 0,
+        cache_hits_prev_session: 0,
+        cache_hits_this_session: 0,
         last_status: std::collections::BTreeMap::new(),
         terminal_width: display.size.1,
         terminal_rows: display.size.0,
@@ -2467,6 +2502,18 @@ async fn handle_review_command(
                     p.completed_stages += 1;
                     render_progress(&mut s);
                 }
+            }
+            // Added up rather than stored: each event carries what the cache has
+            // served since the last one, because the counters behind it belong to
+            // a provider built afresh for every patch and every attempt.
+            ProgressEvent::AiReviewCacheHits {
+                patch_index: _,
+                prev_session,
+                this_session,
+            } => {
+                s.cache_hits_prev_session += prev_session;
+                s.cache_hits_this_session += this_session;
+                render_progress(&mut s);
             }
             ProgressEvent::AiReviewAttempt {
                 patch_index: _,
@@ -3897,6 +3944,8 @@ mod tests {
             patches: std::collections::BTreeMap::new(),
             last_status: std::collections::BTreeMap::new(),
             total_turns: 0,
+            cache_hits_prev_session: 0,
+            cache_hits_this_session: 0,
             terminal_width: display.size.1,
             terminal_rows: display.size.0,
             color_choice: display.color,
@@ -4196,6 +4245,37 @@ mod tests {
         let painted = String::from_utf8(frame.into_inner()).expect("utf-8");
         assert_eq!(state.reserved, 3);
         assert!(painted.contains("\x1b[1;21r"), "{painted:?}");
+    }
+
+    #[test]
+    fn test_a_painted_frame_says_what_the_cache_served() {
+        let mut state = progress_state(reserving((24, 100)));
+        state.patches.insert(1, patch_state(PatchStatus::Reviewing));
+        state.total_turns = 401;
+
+        let paint = |state: &mut ProgressState| {
+            let mut frame = Buffer::no_color();
+            paint_progress(state, &mut frame).expect("paint a frame");
+            String::from_utf8(frame.into_inner()).expect("utf-8")
+        };
+
+        // A review with the cache off, which is most of them: the Overall line
+        // ends at the turn count, as it did before there was anything to add.
+        let painted = paint(&mut state);
+        assert!(painted.contains("401 turns"), "{painted:?}");
+        assert!(!painted.contains("cached"), "{painted:?}");
+        assert!(!painted.contains("repeated"), "{painted:?}");
+
+        state.cache_hits_prev_session = 7;
+        let painted = paint(&mut state);
+        assert!(painted.contains("401 turns (7 cached)"), "{painted:?}");
+
+        state.cache_hits_this_session = 2;
+        let painted = paint(&mut state);
+        assert!(
+            painted.contains("401 turns (7 cached, 2 repeated)"),
+            "{painted:?}"
+        );
     }
 
     #[test]
@@ -4655,6 +4735,23 @@ mod tests {
         assert_eq!(calculate_progress_metrics(1, 5, 20), (1, 100, 20));
         assert_eq!(calculate_progress_metrics(5, 2, 20), (2, 40, 8));
         assert_eq!(calculate_progress_metrics(0, 5, 20), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_the_overall_line_names_only_the_cache_figures_it_has() {
+        // Nothing to say, said as nothing: the cache is off for most runs, and
+        // the line has to read as it did before rather than end in "()".
+        assert_eq!(cache_hits_suffix(0, 0), "");
+
+        // One figure on its own carries no comma, which is the whole reason this
+        // is not a format string with two slots.
+        assert_eq!(cache_hits_suffix(7, 0), " (7 cached)");
+        assert_eq!(cache_hits_suffix(0, 2), " (2 repeated)");
+
+        // Both, in that order: what a previous session saved first, then what
+        // this one repeated.
+        assert_eq!(cache_hits_suffix(7, 2), " (7 cached, 2 repeated)");
+        assert_eq!(cache_hits_suffix(1, 1), " (1 cached, 1 repeated)");
     }
 
     #[test]

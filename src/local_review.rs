@@ -156,6 +156,19 @@ pub enum ProgressEvent {
         turn: usize,
         max_turns: usize,
     },
+    /// What the response cache served since this was last reported, rather than
+    /// a running total. The counters belong to one `CachingAiProvider` and
+    /// `review_single_patch` builds a new one per patch and per attempt, so a
+    /// total would start over partway through a review.
+    AiReviewCacheHits {
+        patch_index: i64,
+        /// Hits on entries a previous session wrote: stages this review did not
+        /// have to run again.
+        prev_session: u64,
+        /// Hits on entries this session wrote: the same request made twice,
+        /// which is mostly a retried attempt repeating stages it had done.
+        this_session: u64,
+    },
     AiReviewStageFinished {
         patch_index: i64,
         stage: String,
@@ -487,6 +500,55 @@ fn extract_inline_review(patch_index: i64, output: Option<&Value>) -> Result<Opt
     Ok(inline_content)
 }
 
+/// The cache hits a provider has served since the last time anyone asked.
+///
+/// Reports the change rather than the figure, because the figure belongs to one
+/// `CachingAiProvider`: `review_single_patch` builds a new one per patch and per
+/// attempt, so a display adding up totals would see the count fall back to zero
+/// on the second attempt and on every patch after the first.
+///
+/// A provider with no cache behind it answers `None` to `cache_stats()`, which
+/// is the daemon-spawned worker: it reaches the model through a stdio provider
+/// and the cache sits on the daemon's side of it.
+struct CacheHitsSinceLast {
+    provider: Arc<dyn crate::ai::AiProvider>,
+    prev_session: std::sync::atomic::AtomicU64,
+    this_session: std::sync::atomic::AtomicU64,
+}
+
+impl CacheHitsSinceLast {
+    fn new(provider: Arc<dyn crate::ai::AiProvider>) -> Self {
+        Self {
+            provider,
+            prev_session: std::sync::atomic::AtomicU64::new(0),
+            this_session: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// The hits since the previous call, or None where there are none to report
+    /// and where the provider keeps no cache at all.
+    ///
+    /// Each counter is read and replaced in one step, so two callers at once
+    /// split the change between them rather than both reporting all of it. The
+    /// two are not read together, which costs nothing: a hit counted on one side
+    /// of a caller and not the other is reported by the next call.
+    fn take(&self) -> Option<(u64, u64)> {
+        use std::sync::atomic::Ordering;
+
+        let stats = self.provider.cache_stats()?;
+        let prev = stats.hits_prev_session.saturating_sub(
+            self.prev_session
+                .swap(stats.hits_prev_session, Ordering::Relaxed),
+        );
+        let this = stats.hits_this_session.saturating_sub(
+            self.this_session
+                .swap(stats.hits_this_session, Ordering::Relaxed),
+        );
+
+        (prev > 0 || this > 0).then_some((prev, this))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn review_single_patch(
     worktree: &GitWorktree,
@@ -540,6 +602,9 @@ async fn review_single_patch(
             .await
             .context("Failed to create AI provider")?;
         let provider = decorate_provider(provider, ai, llm_semaphore, quota, &retry_budget);
+        // Asked of the decorated provider, which forwards cache_stats() down to
+        // the cache the same way it forwards a request.
+        let cache_hits = Arc::new(CacheHitsSinceLast::new(provider.clone()));
         // The directory itself: read_prompt resolves a name against it.
         let prompts_tool_path = Some(options.prompts.clone());
 
@@ -602,6 +667,7 @@ async fn review_single_patch(
         );
 
         let p_index = p.index;
+        let stage_hits = cache_hits.clone();
         let progress_cb = progress.map(|cb| {
             move |event| match event {
                 crate::worker::WorkerProgressEvent::PrefetchStarted => {
@@ -653,6 +719,17 @@ async fn review_single_patch(
                         patch_index: p_index,
                         stage,
                     });
+                    // Where the stage's turns came out of the cache, say so as it
+                    // ends: a stage served entirely from a previous session
+                    // finishes in a moment, and the display would otherwise show
+                    // the work as done with nothing to say why it was so quick.
+                    if let Some((prev_session, this_session)) = stage_hits.take() {
+                        cb(ProgressEvent::AiReviewCacheHits {
+                            patch_index: p_index,
+                            prev_session,
+                            this_session,
+                        });
+                    }
                 }
             }
         });
@@ -665,15 +742,31 @@ async fn review_single_patch(
             "baseline": baseline_sha
         });
 
-        match worker
+        let outcome = worker
             .run(
                 patchset_val,
                 progress_cb
                     .as_ref()
                     .map(|f| f as &(dyn Fn(_) + Send + Sync)),
             )
-            .await
-        {
+            .await;
+
+        // Whatever the cache served after the last stage said it was finished,
+        // asked for before this attempt's provider goes out of scope and takes
+        // its counters with it. A failed attempt is asked too: its hits were
+        // served, and the next attempt starts a provider that counts from zero.
+        if let Some((prev_session, this_session)) = cache_hits.take() {
+            emit(
+                progress,
+                ProgressEvent::AiReviewCacheHits {
+                    patch_index: p.index,
+                    prev_session,
+                    this_session,
+                },
+            );
+        }
+
+        match outcome {
             Ok(result) => {
                 let inline_content = if options.agent {
                     None
@@ -1503,6 +1596,37 @@ mod tests {
         Arc::new(StubProvider)
     }
 
+    /// A provider that keeps a cache whose counters a test can move.
+    struct CachingStub {
+        prev: std::sync::atomic::AtomicU64,
+        this: std::sync::atomic::AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::ai::AiProvider for CachingStub {
+        async fn generate_content(
+            &self,
+            _request: crate::ai::AiRequest,
+        ) -> Result<crate::ai::AiResponse> {
+            unreachable!("this stub only answers cache_stats()")
+        }
+        fn get_capabilities(&self) -> crate::ai::ProviderCapabilities {
+            crate::ai::ProviderCapabilities {
+                model_name: "caching-stub".into(),
+                context_window_size: 1000,
+            }
+        }
+        fn cache_stats(&self) -> Option<crate::ai::CacheStats> {
+            use std::sync::atomic::Ordering;
+            Some(crate::ai::CacheStats {
+                hits_this_session: self.this.load(Ordering::Relaxed),
+                hits_prev_session: self.prev.load(Ordering::Relaxed),
+                tokens_saved_this_session: 0,
+                tokens_saved_prev_session: 0,
+            })
+        }
+    }
+
     /// Fails the first call with a rate limit, then succeeds, so a test can
     /// tell whether the retry limiter was actually installed.
     struct RateLimitOnce {
@@ -1618,6 +1742,38 @@ mod tests {
         // is already past its deadline stops rather than retrying through it.
         assert_eq!(inner.calls.load(Ordering::SeqCst), 0);
         Ok(())
+    }
+
+    #[test]
+    fn test_cache_hits_are_reported_as_the_change_since_the_last_look() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let cache = Arc::new(CachingStub {
+            prev: AtomicU64::new(0),
+            this: AtomicU64::new(0),
+        });
+        let hits = CacheHitsSinceLast::new(cache.clone());
+
+        // Nothing served yet, so nothing to report: the display would otherwise
+        // paint a parenthesis full of zeroes for every stage of every review.
+        assert_eq!(hits.take(), None);
+
+        cache.prev.store(5, Ordering::Relaxed);
+        cache.this.store(1, Ordering::Relaxed);
+        assert_eq!(hits.take(), Some((5, 1)));
+
+        // Asked again with nothing new in between. A running total would have the
+        // display add the same five hits a second time.
+        assert_eq!(hits.take(), None);
+
+        // Only what arrived since.
+        cache.prev.store(8, Ordering::Relaxed);
+        assert_eq!(hits.take(), Some((3, 0)));
+
+        // A provider with no cache behind it, which is the daemon-spawned worker:
+        // it answers None rather than zeroes, and is not reported at all.
+        let none = CacheHitsSinceLast::new(stub());
+        assert_eq!(none.take(), None);
     }
 
     #[test]
