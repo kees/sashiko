@@ -1100,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn test_thinking_config_present_when_effort_set() {
+    fn test_effort_alone_sends_output_config_only() {
         let req = make_request(vec![AiMessage {
             role: AiRole::User,
             content: Some("hi".to_string()),
