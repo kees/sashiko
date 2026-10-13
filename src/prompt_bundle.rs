@@ -173,11 +173,26 @@ mod tests {
             );
         }
 
+        assert_index_guides_bundled("sashiko");
+    }
+
+    #[test]
+    fn test_kernel_subsystem_index_guides_are_bundled() {
+        // The pre-screen offers the kernel index's guides by name, and a name
+        // with no file behind it loads as nothing, so a guide renamed or
+        // removed by a sync would be lost without any error.
+        assert_index_guides_bundled("kernel");
+    }
+
+    /// Asserts every guide named in `<project>/subsystem/subsystem.md` is in
+    /// the bundle, under subsystem/ or patterns/.
+    fn assert_index_guides_bundled(project: &str) {
+        let index_path = format!("{project}/subsystem/subsystem.md");
         let subsystem_index = PROMPT_BUNDLE_FILES
             .iter()
-            .find(|(p, _)| *p == "sashiko/subsystem/subsystem.md")
+            .find(|(p, _)| *p == index_path)
             .and_then(|(_, bytes)| std::str::from_utf8(bytes).ok())
-            .expect("sashiko/subsystem/subsystem.md must be valid UTF-8");
+            .unwrap_or_else(|| panic!("{index_path} must be valid UTF-8"));
 
         let mut referenced_guides = Vec::new();
         for line in subsystem_index.lines() {
@@ -200,14 +215,14 @@ mod tests {
         );
 
         for guide in referenced_guides {
-            let in_subsystem = format!("sashiko/subsystem/{guide}");
-            let in_patterns = format!("sashiko/patterns/{guide}");
+            let in_subsystem = format!("{project}/subsystem/{guide}");
+            let in_patterns = format!("{project}/patterns/{guide}");
             let found = PROMPT_BUNDLE_FILES
                 .iter()
                 .any(|(p, _)| *p == in_subsystem || *p == in_patterns);
             assert!(
                 found,
-                "guide {guide} referenced in sashiko/subsystem/subsystem.md not found in bundle under subsystem/ or patterns/"
+                "guide {guide} referenced in {index_path} not found in bundle under subsystem/ or patterns/"
             );
         }
     }
