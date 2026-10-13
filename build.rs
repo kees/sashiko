@@ -17,9 +17,13 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+#[path = "src/prompt_fingerprint.rs"]
+mod prompt_fingerprint;
+
 fn main() {
     println!("cargo:rerun-if-changed=third_party/prompts");
     println!("cargo:rerun-if-changed=projects");
+    println!("cargo:rerun-if-changed=src/prompt_fingerprint.rs");
 
     track_git_changes();
 
@@ -65,21 +69,33 @@ fn main() {
     files.extend(first_party.iter().cloned());
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
-    // The vendored tree stamps its own revision, and the bundle is installed
-    // into a directory named after it. That alone would pin the first-party
-    // tree to the vendored tree's release cadence: editing a first-party
-    // prompt would leave the installed copy untouched, because the revision
-    // directory already exists and is marked complete. Folding the
-    // first-party content into the revision makes an edit produce a new
-    // directory, which is what makes the edit take effect.
+    // The bundle is installed into a directory named after its revision, and
+    // an existing directory marked complete is used as it is. So the revision
+    // must change whenever any bundled file does, or an edited prompt never
+    // reaches an installed copy. The vendored tree's REVISION names the
+    // review-prompts snapshot it came from, but local changes to that tree
+    // land without touching it, so it serves only as a readable prefix.
+    // Fingerprinting every file, vendored and first-party, is what makes an
+    // edit produce a new directory, and keeps two builds with different
+    // prompts from sharing one.
     let vendored_revision = fs::read_to_string(vendored_dir.join("REVISION"))
         .unwrap_or_else(|_| "unknown".to_string())
         .trim()
         .to_string();
-    let revision = format!(
-        "{vendored_revision}-{:016x}",
-        content_fingerprint(&first_party)
+    let contents: Vec<(&str, Vec<u8>)> = files
+        .iter()
+        .map(|(relative, absolute)| {
+            let content = fs::read(absolute)
+                .unwrap_or_else(|e| panic!("failed to read prompt {}: {e}", absolute.display()));
+            (relative.as_str(), content)
+        })
+        .collect();
+    let fingerprint = prompt_fingerprint::content_fingerprint(
+        contents
+            .iter()
+            .map(|(relative, content)| (*relative, content.as_slice())),
     );
+    let revision = format!("{vendored_revision}-{fingerprint:016x}");
 
     let mut generated_bytes = Vec::new();
     writeln!(
@@ -158,23 +174,6 @@ fn collect_projects_prompts(projects_dir: &Path) -> Vec<(String, PathBuf)> {
     }
     files.sort_by(|a, b| a.0.cmp(&b.0));
     files
-}
-
-/// A value that changes whenever any collected file's path or content changes.
-///
-/// Only inequality matters: a collision would leave an edited prompt
-/// uninstalled, and a spurious change merely reinstalls the bundle.
-fn content_fingerprint(files: &[(String, PathBuf)]) -> u64 {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    for (relative, absolute) in files {
-        relative.hash(&mut hasher);
-        fs::read(absolute)
-            .unwrap_or_else(|e| panic!("failed to read prompt {}: {e}", absolute.display()))
-            .hash(&mut hasher);
-    }
-    hasher.finish()
 }
 
 fn track_git_changes() {

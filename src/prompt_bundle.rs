@@ -19,6 +19,10 @@ use crate::project::ProjectId;
 
 include!(concat!(env!("OUT_DIR"), "/prompts_generated.rs"));
 
+#[cfg(test)]
+#[path = "prompt_fingerprint.rs"]
+mod prompt_fingerprint;
+
 const COMPLETE_MARKER: &str = ".sashiko-prompts-complete";
 
 /// The installed prompt directory for a project.
@@ -112,6 +116,23 @@ mod tests {
             PROMPT_BUNDLE_FILES
                 .iter()
                 .any(|(path, _)| *path == "kernel/review-core.md")
+        );
+    }
+
+    #[test]
+    fn test_prompt_bundle_revision_covers_every_file() {
+        // The installed bundle is reused while its revision is unchanged, so
+        // the revision must account for every file in it, the vendored ones
+        // included. build.rs computes it with the same function, over the
+        // files as it read them from disk; this computes it over the files as
+        // they were embedded.
+        let fingerprint = format!(
+            "-{:016x}",
+            prompt_fingerprint::content_fingerprint(PROMPT_BUNDLE_FILES.iter().copied())
+        );
+        assert!(
+            PROMPT_BUNDLE_REVISION.ends_with(&fingerprint),
+            "{PROMPT_BUNDLE_REVISION} does not end with the fingerprint of the bundled files, {fingerprint}"
         );
     }
 
