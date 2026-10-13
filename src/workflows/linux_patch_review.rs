@@ -1434,7 +1434,7 @@ pub fn enrich_post_verification_output(
 pub fn prescreen_stage() -> Stage<LinuxPatchReviewState, PrescreenOutput> {
     Stage::builder("pre-screen")
         .system_prompt(PromptTemplate::<LinuxPatchReviewState>::new(
-            "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking.md\", \"locking.md\"]}\n```",
+            "You are an AI assistant preparing a Linux kernel patch review.\nReview the provided Patch and select all potentially relevant subsystem guides from the index below.\nCRITICAL BIAS RULE: You MUST err on the side of inclusion. Only exclude a guide if it is 100% irrelevant to the modified code. If there is any doubt, include the file.\n\nYou MUST respond with ONLY a JSON object, no other text. Example:\n```json\n{\"selected_prompts\": [\"networking-core.md\", \"locking.md\"]}\n```",
         ))
         .user_prompt(
             PromptTemplate::<LinuxPatchReviewState>::new(
