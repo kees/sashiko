@@ -187,6 +187,7 @@ Author: Yonghong Song <yonghong.song@linux.dev>
 >
 >     Signed-off-by: Yonghong Song <yonghong.song@linux.dev>
 
+[Severity: Low]
 This looks like a bug fix for stack argument support.  Should this include:
 
   Fixes: 3330ee8db989 ("bpf: Support stack arguments for bpf functions")
