@@ -8,24 +8,6 @@ any summary, comments or questions you add should be wrapped at 78 characters
 
 - Never include bugs filtered out as false positives in the report
 
-- Never include, quote, cite, summarize, or refer to automated reviews or bot
-  comments. Case-insensitively, the final report must not mention Sashiko, sashiko-bot,
-  sashiko.dev, BPF CI prior reviews, bot+bpf-ci, kernel-patches-review-bot,
-  Claude, AI review output, GitHub Actions CI run summaries, or any other bot
-  as evidence for an issue.
-
-  Note: ``Assisted-by:`` tags in commit messages are NOT bot review evidence.
-  They are documented kernel metadata per
-  Documentation/process/coding-assistants.rst and should never be flagged as
-  issues. The ban above applies to citing AI/bot tools as *independent
-  corroboration* for a finding (\"Claude also found this bug\"), not to the
-  ``Assisted-by:`` trailer itself.
-
-- If an issue depends on, overlaps, or repeats automated review feedback, omit
-  the entire issue. Do not rewrite "Sashiko found this" into neutral wording.
-  Only report issues supported independently by source code, commit messages,
-  or non-bot human review comments.
-
 - Always end the report with a blank line.
 
 - The report must be conversational with undramatic wording, fit for sending
@@ -69,9 +51,8 @@ the author.
   but should be reworded to fit the template requirements.
 
 - You MUST include every issue sent, even if the additional details explain the
-  issue was fixed in a later commit. The only exception is automated review
-  suppression: if an issue contains or repeats bot review evidence, omit the
-  entire issue.
+  issue was fixed in a later commit.  Your job is to format issues, not decide
+  which ones are worth including.
 
 - Do not add additional explanatory content about why something matters or what
   benefits it provides. State the issue and the suggestion, nothing more.
@@ -296,12 +277,6 @@ Create a note for these items, all of which your report should include:
   front of your new text.
 - [ ] Place your questions as close as possible to the buggy section of code.
 - [ ] Place a severity tag in square brackets on its own line right above each inline comment block, exactly in this format: `[Severity: <level>]` (where <level> is Critical, High, Medium, or Low).
-- [ ] Search the final report case-insensitively for forbidden automated review evidence:
-      `sashiko`, `sashiko.dev`, `bot+bpf-ci`, `kernel-patches-review-bot`,
-      `Claude`, `AI review found`, `AI reviewed your patch`, `CI run summary`,
-      and `netdev-ai.bots.linux.dev`. If any appear outside quoted commit text
-      that is itself being reviewed as a commit-message issue, remove the entire
-      affected issue and regenerate the report.
 - [ ] Snip portions of the quoted content unrelated to your review
   - [ ] Check every hunk to see if it is relevant to the review comments.
   - [ ] ensure diff headers are retained for the files owning any hunks keep
