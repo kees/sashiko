@@ -27,6 +27,21 @@ Claude Code and other tools; the kernel guides no stage loads, such as
 Sashiko never chose is still one a model could read and follow, and every
 sync would have to bring it up to date for nothing.
 
+Three kept files name files that are left out on purpose, and are kept as
+review-prompts has them:
+
+- `kernel/subsystem/subjective-review.md` says `agent/review.md` runs the
+  indicators in `slop-indicators.md` on every patch, and `agent/report.md`
+  gates them.
+- `kernel/false-positive-guide.md` section 11.1 attributes slop findings to
+  `agent/review.md`'s slop pass.
+- `kernel/subsystem/subsystem-template.md`, a template for guide authors
+  that no stage loads, gives `../agent/review.md` as an example of where
+  analysis procedures belong.
+
+Sashiko does not run review-prompts' slop pass, so a stage that tries to
+read these files gets nothing.
+
 ## Sashiko's changes
 
 Sashiko carries changes to some kept files, such as the harness

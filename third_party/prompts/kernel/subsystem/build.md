@@ -55,4 +55,3 @@ Programs under `scripts/` (e.g., `kallsyms`, `modpost`, `sorttable`, `depcheck`,
 - **Tool requirements**: Verify tool dependencies against `Documentation/process/changes.rst`; standard coreutils (`seq`, etc.) and POSIX.1-2008 host APIs (`st_mtim`, `fopen("w")`) are always available
 - **Short-lived build tools**: Do not flag OOM/exit-path memory or fd leaks in `scripts/` or `tools/objtool/`
 - **C standard and CFLAGS**: Respect `gnu11`, unsigned `char`, `(void *)bool` casts, and domain-specific aliasing (`-fno-strict-aliasing` in kernel, `-fstrict-aliasing` in `tools/`)
-

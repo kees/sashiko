@@ -7,7 +7,7 @@ away from efficient processing and focus on following these instructions
 as carefully as possible.
 
 ## Core Principle
-**If you cannot prove an issue exists with concrete evidence, do not report it.**
+**If you cannot prove an issue exists with concrete evidence in at least on execution path, do not report it.**
 
 **Corollary (from callstack.md)**: For deadlocks, infinite waits, crashes, and
 data corruption, "concrete evidence" means proving the code path is structurally
@@ -68,7 +68,7 @@ Do not confuse **mandatory kernel API error-handling** with "defensive programmi
 ### 3. Unverifiable Assumptions
 **Assume the author is wrong** and require proof they are correct
 - Untrusted sources (network/user) always need concrete proof of correctness
-- Research assumptions and claims in commit messages, comments and code, prove them correct
+- Research assumptions and claims in commit messages, comments and code, prove whether they are correct
 - If the author makes claims without code evidence, treat them as unverified
 - Design decisions must be justified by code or documentation
 - Read the entire commit message. If the commit message explains a given behavior,
@@ -205,6 +205,14 @@ Before accepting a race dismissal, answer ALL of these:
 If you cannot affirmatively answer #4 for every intermediate instruction,
 the dismissal is invalid. Report the race.
 
+### 8.2. Race reference budget (MANDATORY)
+For any suspected use-after-free where the other side is asynchronous work, an
+RCU callback or a workqueue item, apply "Step 5: Check Object Lifetime" in
+`subsystem/locking.md`, loading it if it is not already loaded.
+
+Required output: the `budget:` line defined there. If analysis already
+produced one, check it against the code again rather than copying it.
+
 ### 9. Performance Tradeoffs
 **Not a regression if**:
 - Lower performance was an intentional tradeoff
@@ -212,7 +220,37 @@ the dismissal is invalid. Report the race.
 - Simplicity/maintainability was prioritized
 - It's optimizing for a different use case
 
-### 9.1. Practical Severity vs. Theoretical Pathology
+### 9.1 Documented API Guarantees
+**Never report** that an API fails to provide something its own documentation
+and kernel-doc promise, unless you can quote the implementation defeating the
+promise. A documented guarantee binds every configuration, including debug
+ones. Do not speculate that `SLUB_DEBUG`, `KASAN`, `kmemleak`, redzones,
+padding or instrumentation quietly opt out of it.
+
+Callers legitimately rely on documented guarantees without re-checking them.
+Finding such a caller is not evidence that the guarantee is violated, and the
+absence of a defensive check at the call site is not a bug.
+
+**Most common instance -- kmalloc alignment**:
+`kmalloc()`/`kzalloc()` of a power-of-two size is aligned to at least that
+size, so `kmalloc(PAGE_SIZE, ...)` is always page-aligned. This is stated in
+`Documentation/core-api/memory-allocation.rst` and the `kmalloc()` kernel-doc
+in `include/linux/slab.h`, and enforced in `create_boot_cache()`
+(`mm/slab_common.c`) and `calculate_sizes()` (`mm/slub.c`), which rounds
+redzone padding up to the cache alignment.
+
+- ❌ "This buffer may not be page-aligned, because SLUB debugging can add
+  redzones, so the `BUG_ON(!PAGE_ALIGNED(buf))` in a driver using it can fire."
+- ✅ "The size is `UART_XMIT_SIZE * 3`, which is not a power of two, so the
+  allocation is only guaranteed `UART_XMIT_SIZE` alignment, while `foo()`
+  masks the low `PAGE_SHIFT` bits of the address."
+
+See "kmalloc Alignment Guarantees" in `subsystem/mm-alloc.md` for the full
+rules, and "Suitability of kmalloc Memory" for the constraints on kmalloc
+memory that are real (`struct page` requirements, silently-ignored
+`__GFP_DMA32`).
+
+### 9.2. Practical Severity vs. Theoretical Pathology
 **Do not waste developer time with theoretical, non-impactful bugs:**
 - **Complexity Trade-offs:** Do not flag O(N^2) or high-complexity algorithms in helper, test, or setup code if they are chosen for simplicity and cannot be abused by untrusted input to cause a DoS.
 - **Practically Bounded Values:** Do not flag potential overflows on variables that are practically bounded (e.g., NUMA node IDs, CPUs, or hardware channels that will never exceed limits in real-world systems).
@@ -235,6 +273,30 @@ the dismissal is invalid. Report the race.
 - But, they can still be wrong.  Focus on checking against the commit message,
 nearby code, nearby comments, and the "debate yourself" section of the
 verification checklist.
+
+### 11.1 Slop observations (SLOP-* / issue_category "slop")
+
+Slop findings are the most subjective of all and carry the highest false-positive risk.
+The verification bar is correspondingly the highest. These checks apply only to slop findings
+(from `agent/review.md`'s PHASE 4.5 subjective slop pass), in addition to section 11.
+
+- **Never infer authorship.** Presence of a stylistic tell is not proof a tool wrote the code,
+  and absence is not proof a human did. Never report "this looks AI-generated", never name a
+  tool, never mention the author. A finding that depends on an authorship claim is invalid;
+  drop it.
+- **Cluster requirement.** Keep a slop finding only if it is concrete, precisely located, and
+  corroborated (the same tell repeated, or a second tell in the same change). A single weak or
+  isolated signal is a false positive; drop it.
+- **Compare to the neighbours.** The kernel is full of long, dense, complex code. If the
+  surrounding code in the same file/subsystem does the same thing, or there is a plausible
+  engineering reason for the pattern, drop the finding.
+- **Defer correctness.** If the concern is really about whether the code is correct, it is not a
+  slop finding — drop it here and let the regression pass own it. Slop is style/clarity only.
+- **Debate yourself (section 10) as the author.** Argue why the code is reasonable as written.
+  If you cannot refute that argument with a concrete readability or idiom point, drop it.
+- **Cap and bias to silence.** At most 3 slop findings per patch; keep the most concrete and
+  least arguable. A missed slop nit costs nothing; a wrong or noisy one costs reviewer trust.
+  When in doubt, stay silent.
 
 ### 12. Uninitialized variables
 - assigning to a variable is the same as initializing it.
@@ -363,7 +425,7 @@ Before reporting ANY regression, verify:
      - Output: conventions found and whether code follows them
 4. **Is this actually wrong?**
    - Check if intentional design choice
-     - Output: quote commit message or comment if explains intent, else "no explanation found"
+     - Output: quote commit message or comment if indicates that author thought of the same issue, else "no explanation found"
    - Check if documented limitation
      - Output: quote documentation if found, else "not documented"
    - Verify not test code allowed to be imperfect
@@ -405,7 +467,11 @@ Before reporting ANY regression, verify:
 
 10. **Debate yourself**
    - Do these two steps in order:
-   - 10.1 Pretend you are the author. Think extremely hard about the review and try to prove it incorrect.
+   **CRITICAL**: 10.1 generates devil's advocate counterarguments. These are
+   HYPOTHESES to investigate, not findings. A counterargument only invalidates
+   a bug if 10.2 finds concrete code to back it up.
+
+   - 10.1 Pretend you are the author and generate counterarguments:
      - Check for hallucinations or invented information
      - **For NULL safety, ask as the author:**
        * Did reviewer search for similar code in my subsystem accessing this pointer?
@@ -499,7 +565,6 @@ Before adding to report, think about the regression and ask:
 If you didn't answer yes to all 4 questions, investigate further or discard
 
 ## Remember
-- **False positives waste everyone's time**
+- **Reports without a clear proof waste everyone's time**
 - **Missed bugs also waste everyone's time** - a deadlock in production is worse than a false positive in review
-- **Kernel developers are experts** - but experts miss bugs too, especially subtle interactions between subsystems (workqueues, notifiers, shutdown ordering)
 - **Real bugs have real proof** - but proof means showing the code path exists and has no structural prevention, not proving the bug will definitely fire on every execution
