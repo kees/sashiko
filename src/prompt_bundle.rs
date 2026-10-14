@@ -107,11 +107,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_prompt_bundle_contains_kernel_review_core() {
+    fn test_prompt_bundle_contains_kernel_false_positive_guide() {
         assert!(
             PROMPT_BUNDLE_FILES
                 .iter()
-                .any(|(path, _)| *path == "kernel/review-core.md")
+                .any(|(path, _)| *path == "kernel/false-positive-guide.md")
         );
     }
 

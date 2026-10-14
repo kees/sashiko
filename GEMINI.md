@@ -84,7 +84,7 @@ Sashiko reviews changes to its own repository using the `--project sashiko` prof
 ## Configuration, Prompts & Docs
 - `Settings.toml` & `projects/linux/mailing_lists.toml`: Main application and per-mailing-list tracking/delivery policy configuration.
 - `projects/sashiko/prompts/`: First-party review prompts, subsystem invariants, and pattern guides for reviewing Sashiko itself (`--project sashiko`).
-- `third_party/prompts/`: Vendored prompts for upstream projects (`kernel/`, `systemd/`, `iproute/`).
+- `third_party/prompts/`: The vendored upstream prompts the Linux review uses (`kernel/`); its `README.md` lists what is kept.
 - `static/`: Web UI assets (`static/index.html`, images).
 - `docs/`: User and operator documentation (`configuration.md`, `daemon.md`, `sashiko-cli.md`, `llm-providers.md`, `benchmarking.md`, forge setup guides).
 - `designs/`: Architecture and design documents.

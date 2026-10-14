@@ -1,98 +1,52 @@
-# Review Prompts for AI-Assisted Code Review
+# Vendored review prompts
 
-AI-assisted code review prompts for Linux kernel, systemd, and iproute development.
-Works with Claude Code and other AI tools.
+This directory holds the part of Chris Mason's
+[review-prompts](https://github.com/masoncl/review-prompts) that Sashiko's
+Linux patch review uses, as of the review-prompts commit named in
+`REVISION`. `LICENSE` is review-prompts' own.
 
-## Quick Start
+## What is kept
 
-### Install Kernel Prompts Only
+Only the files a Linux review can reach:
 
-```bash
-cd kernel/scripts
-./claude-setup.sh
-```
+- Loaded by the review stages: `kernel/false-positive-guide.md`,
+  `kernel/inline-template.md`, `kernel/callstack.md`,
+  `kernel/technical-patterns.md`, `kernel/subsystem/subsystem.md`, and
+  `kernel/subsystem/locking.md`.
+- Chosen by the pre-screen from that index: the rest of
+  `kernel/subsystem/`.
+- Named by a kept file, for a stage to fetch with `read_prompt`:
+  `kernel/pointer-guards.md`.
+- `kernel/severity.md`, which only Sashiko has.
 
-### Install systemd Prompts Only
+Everything else in review-prompts is left out: the agent prompts, slash
+commands, setup scripts, and skills that run review-prompts' own review in
+Claude Code and other tools; the kernel guides no stage loads, such as
+`review-core.md` and `lore-thread.md`; and the prompts for other projects.
+`read_prompt` can open any file under `kernel/`, so a file kept here that
+Sashiko never chose is still one a model could read and follow, and every
+sync would have to bring it up to date for nothing.
 
-```bash
-cd systemd/scripts
-./claude-setup.sh
-```
+## Sashiko's changes
 
-### Install iproute Prompts Only
+Sashiko carries changes to some kept files, such as the harness
+adaptations in `kernel/inline-template.md`; `git log -- third_party/prompts`
+gives the reason for each. Changes that do not depend on Sashiko's harness
+belong in review-prompts too.
 
-```bash
-cd iproute/scripts
-./claude-setup.sh
-```
+## Syncing
 
-### Install All
+To sync with a newer review-prompts commit:
 
-```bash
-cd kernel/scripts && ./claude-setup.sh
-cd ../../systemd/scripts && ./claude-setup.sh
-cd ../../iproute/scripts && ./claude-setup.sh
-```
+1. Copy the kept files from it: the files listed above, every guide under
+   `kernel/subsystem/`, including new ones, and none that review-prompts
+   has removed.
+2. Keep Sashiko's changes on top, each merged against the review-prompts
+   version it descends from.
+3. Set `REVISION` to that commit.
+4. If a kept file now names a file outside this set, either bring that
+   file in and list it above, or leave it out and say why here. The bundle
+   tests check that every guide `kernel/subsystem/subsystem.md` names is
+   present.
 
-## Available Commands
-
-| Project | Review | Debug | Verify |
-|---------|--------|-------|--------|
-| Kernel | `/kreview` | `/kdebug` | `/kverify` |
-| systemd | `/systemd-review` | `/systemd-debug` | `/systemd-verify` |
-| iproute | `/iproute-review` | `/iproute-debug` | `/iproute-verify` |
-
-## Project Documentation
-
-* [Kernel Review Prompts](kernel/README.md) - Linux kernel specific patterns and protocols
-* [systemd Review Prompts](systemd/README.md) - systemd specific patterns and protocols
-* [iproute Review Prompts](iproute/README.md) - iproute specific patterns and protocols
-
-## How It Works
-
-Each project has:
-- **Skill file** - Automatically loads context when working in the project tree
-- **Slash commands** - Quick access to review, debug, and verify workflows
-- **Subsystem files** - Domain-specific knowledge loaded on demand
-
-The skills detect your working directory and load appropriate context:
-- In a kernel tree: kernel skill loads automatically
-- In a systemd tree: systemd skill loads automatically
-- In an iproute tree: iproute skill loads automatically
-
-## Structure
-
-```
-review-prompts/
-├── kernel/                    # Linux kernel prompts
-│   ├── skills/               # Skill template
-│   ├── slash-commands/       # /kreview, /kdebug, /kverify
-│   ├── scripts/              # Setup script and utilities
-│   ├── patterns/             # Bug pattern documentation
-│   └── *.md                  # Subsystem and protocol files
-│
-├── systemd/                   # systemd prompts
-│   ├── skills/               # Skill template
-│   ├── slash-commands/       # /systemd-review, /systemd-debug, /systemd-verify
-│   ├── scripts/              # Setup script
-│   ├── patterns/             # Bug pattern documentation
-│   └── *.md                  # Subsystem and protocol files
-│
-├── iproute/                  # iproute prompts
-│   ├── skills/               # Skill template
-│   ├── slash-commands/       # /iproute-review, /iproute-debug, /iproute-verify
-│   ├── scripts/              # Setup script
-│   ├── patterns/             # Bug pattern documentation
-│   └── *.md                  # Subsystem and protocol files
-│
-└── README.md                  # This file
-```
-
-## Semcode Integration
-
-These prompts work best with [semcode](https://github.com/facebookexperimental/semcode)
-for fast code navigation and semantic search.
-
-## License
-
-See [LICENSE](LICENSE) for license information.
+When Sashiko starts loading a file, add it to the list above.
